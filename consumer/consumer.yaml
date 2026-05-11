@@ -1,0 +1,395 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCLAIMER — Training / educational example only.
+# Do NOT deploy as-is in production. Review credentials, hostnames, cert
+# issuers, resource sizing, persistence, and disabled subcharts first.
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer deployment example for DSC chart 9.0.3.
+# A consumer ISSUES VCs to its own users and publishes its DID; nothing else.
+# No Verifier/CCS/TIL/APISIX/Scorpio/TMForum/Marketplace.
+
+# Off = `issuance-secret` is provisioned externally (sealed-secrets/Vault).
+# Must contain at least `keycloak-admin` and `store-pass`.
+issuance:
+  generatePasswords:
+    enabled: false
+
+# cert-manager: Keycloak ingress TLS + DID EC keypair (used for VC signing).
+cert-manager:
+  enabled: true
+certManagerResources:
+  enabled: true
+  namespace: cert-manager
+  type: "prod"
+
+# Enable only Zalando managedPostgres (used by Keycloak) from decentralized-iam.
+# All authn/authz services stay OFF — a pure consumer doesn't verify VCs.
+decentralizedIam:
+  enabled: true
+  vcAuthentication:
+    enabled: true
+    # Cluster-wide Zalando postgres-operator. Set to `false` if already installed elsewhere.
+    postgres-operator:
+      enabled: true
+    managedPostgres:
+      enabled: true
+      config:
+        teamId: "consumer"
+        numberOfInstances: 1
+        postgresql:
+          version: "16"
+        volume:
+          size: 4Gi
+          storageClass: gp2  # AWS EKS — change for non-EKS clusters
+        users:
+          admin:    [superuser, createdb]
+          keycloak: [createdb]
+        databases:
+          keycloakdb: keycloak
+    trusted-issuers-list:        { enabled: false }
+    credentials-config-service:  { enabled: false }
+    vcverifier:                  { enabled: false }
+  odrlAuthorization:   { enabled: false }
+
+# Everything else a consumer does NOT need.
+mongo-operator:      { enabled: false }
+managedMongo:        { enabled: false }
+scorpio:             { enabled: false }
+tm-forum-api:        { enabled: false }
+contract-management: { enabled: false }
+fdsc-dashboard:      { enabled: false }
+marketplace:         { enabled: false }
+vault:               { enabled: false }
+fdsc-edc:            { enabled: false }
+identityhub:         { enabled: false }
+elsi:                { enabled: false }
+rainbow:             { enabled: false }
+dataSpaceConfig:     { enabled: false }
+registration:        { enabled: false }
+credentials:         { enabled: false }
+
+# Keycloak: VC Issuer (OID4VCI) for the consumer's own users.
+# Bitnami moved the image to `bitnamilegacy/keycloak`; override repo + allowInsecureImages,
+# otherwise ImagePullBackOff.
+keycloak:
+  enabled: true
+  kubeVersion: 1.34-1
+  metrics: { enabled: true }
+  global:
+    security:
+      allowInsecureImages: true
+  image:
+    repository: bitnamilegacy/keycloak
+  containerSecurityContext: { enabled: false }
+  ingress:
+    pathType: Prefix
+    annotations:
+      cert-manager.io/common-name: accounts-consumer.example.com
+      cert-manager.io/cluster-issuer: prod
+      kubernetes.io/ingress.class: nginx
+    enabled: true
+    hostname: accounts-consumer.example.com
+    ingressClassName: nginx
+    tls: true
+  proxyHeaders: xforwarded
+  proxy: edge
+  tls: { enabled: false }
+  service:
+    ports: { http: 8080 }
+    extraPorts:
+      - { name: management, port: 9000, targetPort: 9000 }
+  auth:
+    existingSecret: issuance-secret
+    passwordSecretKey: keycloak-admin
+    adminUser: keycloak-admin
+  resources:
+    requests: { memory: "500Mi", cpu: "0.5" }
+    limits:   { memory: "2Gi",   cpu: "1" }
+  livenessProbe:  { failureThreshold: 20 }
+  readinessProbe: { failureThreshold: 20 }
+  # Use the Zalando-managed Postgres declared above instead of the bundled bitnami one.
+  postgresql: { enabled: false }
+  externalDatabase:
+    host: postgres
+    database: keycloakdb
+    user: keycloak
+    existingSecret: keycloak.postgres.credentials.postgresql.acid.zalan.do
+    existingSecretPasswordKey: password
+  extraVolumeMounts:
+    - { name: did-material, mountPath: /did-material }
+    - { name: realms,       mountPath: /opt/bitnami/keycloak/data/import }
+  extraVolumes:
+    - name: did-material
+      emptyDir: {}
+    - name: realms
+      # ConfigMap rendered by the chart from `keycloak.realm` below.
+      configMap: { name: consumer-realm }
+    - name: did-priv-key
+      secret: { secretName: did-consumer.example.com-tls }
+  # Builds a PKCS12 keystore from the cert-manager PEM keypair (Keycloak signs VCs
+  # from PKCS12, not PEM). Alias `didPrivateKey` matches `signingKey.keyAlias`.
+  initContainers:
+    - name: get-did
+      image: alpine/openssl:latest
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          openssl pkcs12 -export \
+            -in /certs-did/tls.crt \
+            -inkey /certs-did/tls.key \
+            -out /did-material/cert.pfx \
+            -name "didPrivateKey" \
+            -passout env:STORE_PASS
+          chmod 644 /did-material/cert.pfx
+      env:
+        - name: STORE_PASS
+          valueFrom:
+            secretKeyRef: { name: issuance-secret, key: store-pass }
+      volumeMounts:
+        - { name: did-material, mountPath: /did-material }
+        - { name: did-priv-key, mountPath: /certs-did }
+  # KC_FEATURES=oid4vc-vci   → enables the OID4VCI issuer (preview feature).
+  # --import-realm           → loads the realm JSON from `keycloak.realm` on startup.
+  # DID                      → substituted into ${DID} at realm import time.
+  extraEnvVars:
+    - name: KEYCLOAK_EXTRA_ARGS
+      value: "--import-realm --health-enabled true"
+    - name: KC_FEATURES
+      value: "oid4vc-vci"
+    - name: KC_HEAP_SIZE
+      value: "1024m"
+    - name: DID
+      value: did:web:did-consumer.example.com:did
+    - name: STORE_PASS
+      valueFrom:
+        secretKeyRef: { name: issuance-secret, key: store-pass }
+
+  # Realm structured import.
+  realm:
+    import: true
+    name: consumer
+    frontendUrl: https://accounts-consumer.example.com
+    attributes:
+      sslRequired: "none"
+
+    # Client roles per Keycloak client.
+    # ${DID}                                  → self-client (LegalPersonCredential)
+    # did:web:did-provider.example.com:did    → target peer (OperatorCredential)
+    clientRoles:
+      ${DID}:
+        - { name: customer, description: "Identifies the consumer org",      clientRole: true }
+        - { name: admin,    description: "Admin role inside the consumer",   clientRole: true }
+      did:web:did-provider.example.com:did:
+        - { name: OPERATOR, description: "Allowed to operate the provider's services", clientRole: true }
+
+    users:
+      - username: employee
+        enabled: true
+        email: employee@consumer.org
+        firstName: Test
+        lastName: User
+        credentials:
+          - { type: password, value: "test" }
+        clientRoles:
+          ${DID}: [customer]
+          did:web:did-provider.example.com:did: [OPERATOR]
+          account: [view-profile, manage-account]
+
+    # Convention: ONE client per *target participant*, `clientId == that peer's DID`.
+    # Roles assigned on that client → emitted in the VC with `target` = that DID
+    # (via oid4vc-target-role-mapper). Add one client per provider you consume from.
+    clients:
+      - clientId: ${DID}
+        enabled: true
+        description: Self client (LegalPersonCredential)
+        clientAuthenticatorType: client-secret
+        defaultRoles: []
+        redirectUris: []
+        webOrigins: []
+        notBefore: 0
+        standardFlowEnabled: true
+        protocol: oid4vc
+        protocolMappers: []
+        fullScopeAllowed: true
+        nodeReRegistrationTimeout: -1
+        defaultClientScopes: []
+        optionalClientScopes: []
+      - clientId: did:web:did-provider.example.com:did
+        enabled: true
+        description: Target client for accessing the provider's services
+        clientAuthenticatorType: client-secret
+        defaultRoles: []
+        redirectUris: []
+        webOrigins: []
+        notBefore: 0
+        standardFlowEnabled: true
+        protocol: oid4vc
+        protocolMappers: []
+        fullScopeAllowed: true
+        nodeReRegistrationTimeout: -1
+        defaultClientScopes: []
+        optionalClientScopes: []
+
+    # VC types this realm issues (OID4VCI).
+    # `credential_signing_alg_values_supported` MUST match `signingKey.keyAlgorithm`
+    # and the algorithm of the key inside the PKCS12 keystore.
+    # Mappers populate `credentialSubject`:
+    #   oid4vc-context-mapper        → JSON-LD @context entries
+    #   oid4vc-user-attribute-mapper → copy Keycloak user attribute → VC claim
+    #   oid4vc-target-role-mapper    → roles on client `config.clientId`, scoped to that target DID
+    verifiableCredentials:
+
+      # Identity credential — self-issued, roles scoped to the consumer's own DID.
+      legal-person-sd:
+        attributes:
+          credential_signing_alg_values_supported: ES256
+          credential_build_config.signing_algorithm: ES256
+          credential_build_config.token_jws_type: vc+sd-jwt
+          credential_build_config.proof_types_supported:
+            jwt:
+              proof_signing_alg_values_supported:
+                - ES256
+          format: vc+sd-jwt
+          scope: LegalPersonCredential
+          vct: LegalPersonCredential
+          credential_build_config.visible_claims: roles,email
+          credential_build_config.decoys: 3
+        clientScope:
+          create: true
+        protocolMappers:
+          - name: context-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-context-mapper
+            config:
+              context: https://www.w3.org/2018/credentials/v1
+              supportedCredentialTypes: LegalPersonCredential
+          - name: email-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: email
+              userAttribute: email
+              supportedCredentialTypes: LegalPersonCredential
+          - name: firstName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: firstName
+              userAttribute: firstName
+              supportedCredentialTypes: LegalPersonCredential
+          - name: lastName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: lastName
+              userAttribute: lastName
+              supportedCredentialTypes: LegalPersonCredential
+          - name: role-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-target-role-mapper
+            config:
+              subjectProperty: roles
+              clientId: ${DID}
+              supportedCredentialTypes: LegalPersonCredential
+
+      # Access credential — roles scoped to the target provider's DID.
+      # Duplicate this block per provider you consume from, changing the role-mapper clientId.
+      operator-sd:
+        attributes:
+          credential_signing_alg_values_supported: ES256
+          credential_build_config.signing_algorithm: ES256
+          credential_build_config.token_jws_type: vc+sd-jwt
+          credential_build_config.proof_types_supported:
+            jwt:
+              proof_signing_alg_values_supported:
+                - ES256
+          format: vc+sd-jwt
+          scope: OperatorCredential
+          vct: OperatorCredential
+          credential_build_config.visible_claims: roles,email
+          credential_build_config.decoys: 3
+        clientScope:
+          create: true
+        protocolMappers:
+          - name: context-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-context-mapper
+            config:
+              context: https://www.w3.org/2018/credentials/v1
+              supportedCredentialTypes: OperatorCredential
+          - name: email-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: email
+              userAttribute: email
+              supportedCredentialTypes: OperatorCredential
+          - name: firstName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: firstName
+              userAttribute: firstName
+              supportedCredentialTypes: OperatorCredential
+          - name: lastName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: lastName
+              userAttribute: lastName
+              supportedCredentialTypes: OperatorCredential
+          - name: role-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-target-role-mapper
+            config:
+              subjectProperty: roles
+              clientId: did:web:did-provider.example.com:did
+              supportedCredentialTypes: OperatorCredential
+
+  # `keyAlgorithm` must match the PKCS12 key and `credential_signing_alg_values_supported`.
+  signingKey:
+    storePath: /did-material/cert.pfx
+    storePassword: "${STORE_PASS}"
+    keyAlias: didPrivateKey
+    keyPassword: "${STORE_PASS}"
+    keyAlgorithm: ES256
+    did: did:web:did-consumer.example.com:did
+
+# Publishes the DID Document at https://did-consumer.example.com/did/did.json.
+# Ingress must be reachable by every dataspace peer.
+# Use `did:web` (not `did:key`) — `did:key` ties the identity to the key, blocking rotation.
+did:
+  enabled: true
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: prod
+      cert-manager.io/common-name: did-consumer.example.com
+      cert-manager.io/private-key-algorithm: ECDSA
+      cert-manager.io/private-key-encoding: PKCS8
+      kubernetes.io/ingress.class: nginx
+    hosts:
+      - host: did-consumer.example.com
+        paths:
+          - { path: /, pathType: Prefix }
+    tls:
+      - secretName: did-consumer.example.com-tls
+        hosts: [did-consumer.example.com]
+  volumes:
+    - name: certs
+      secret:
+        secretName: did-consumer.example.com-tls
+        items:
+          - { key: tls.crt, path: tls.crt }
+  volumeMounts:
+    - { name: certs, mountPath: /certs }
+  config:
+    server:
+      runServer: "true"
+      certPath: /certs/tls.crt
+      hostUrl: "https://did-consumer.example.com/did"
+      keystorePasswordSecretName: ""
+      keystorePasswordSecretKey: ""
+      keyAlias: "myAlias"
+    generateKey:
+      enabled: false

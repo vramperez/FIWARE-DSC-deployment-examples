@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCLAIMER — Training / educational example only.
+# Do NOT deploy as-is in production. Review credentials, hostnames, cert
+# issuers, resource sizing, persistence, and disabled subcharts first.
+# ─────────────────────────────────────────────────────────────────────────────
+# Trust Anchor (operator) deployment example for trust-anchor chart 1.0.0.
+
+# Off = provision `issuance-secret` externally (sealed-secrets/Vault).
+generatePasswords:
+  enabled: false
+
+# Zalando postgres-operator (cluster-wide) backing the TIR database.
+postgres-operator:
+  enabled: true
+  configKubernetes:
+    enable_readiness_probe: true
+
+# Postgresql CR reconciled by the operator above.
+managedPostgres:
+  enabled: true
+
+# Acts as the dataspace TIR (Trusted Issuers Registry).
+# Note: same chart, different role — `tir` ingress on (public registry),
+# `til` ingress off (no local TIL on the operator).
+trusted-issuers-list:
+  enabled: true
+  fullnameOverride: tir
+  ingress:
+    tir:
+      enabled: true
+      className: nginx
+      annotations:
+        cert-manager.io/cluster-issuer: prod # Requires cert-manager with a `ClusterIssuer` named `prod` configured to issue for the domain
+        cert-manager.io/common-name: tir.example.com
+        cert-manager.io/private-key-algorithm: ECDSA
+      hosts:
+        - host: tir.example.com
+      tls:
+        - secretName: tir.example.com-tls
+          hosts:
+            - tir.example.com
+    til:
+      enabled: false

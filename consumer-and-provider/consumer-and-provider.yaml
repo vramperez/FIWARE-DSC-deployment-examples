@@ -1,0 +1,1153 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCLAIMER — Training / educational example only.
+# Do NOT deploy as-is in production. Review credentials, hostnames, cert
+# issuers, resource sizing, persistence, and disabled subcharts first.
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer + Provider deployment example for DSC chart 9.0.3.
+# Same provider stack as ../provider/provider.yaml + consumer-side VC issuance
+# so this participant can also consume from peer providers.
+#
+# Identifiers are renamed `provider*` → `coprov*` so this deployment can coexist
+# with the provider-standalone example without collisions:
+#   - DID:    did:web:did-coprov.example.com:did
+#   - Hosts:  accounts-coprov / verifier-coprov / did-coprov / dashboard-coprov /
+#             marketplace-coprov / mp-data-service-coprov (all .example.com)
+#   - Helm release name expected: `coprov` (in namespace `coprov`)
+#
+# Diffs vs the pure provider:
+#   - extra Keycloak client per peer (clientId = peer DID)
+#   - extra `operator-sd` entry in `verifiableCredentials`
+#   - example user gets OPERATOR on the peer client
+
+# Off = `issuance-secret` is provisioned externally (sealed-secrets/Vault).
+# On  = chart generates it; Secret is annotated `resource-policy: keep`.
+issuance:
+  generatePasswords:
+    enabled: false
+
+# Mongo (required by Marketplace/BAE).
+# `mongo-operator` installs the CRDs + operator; `managedMongo.spec` is the
+# `MongoDBCommunity` CR. Sizes below are dev-scale.
+mongo-operator:
+  enabled: true
+  community-operator-crds:
+    enabled: true
+
+managedMongo:
+  enabled: true
+  # -- spec as defined in https://github.com/mongodb/helm-charts/tree/main/charts/community-operator-crds
+  spec:
+    additionalMongodConfig:
+      storage.wiredTiger.engineConfig.journalCompressor: zlib
+    statefulSet:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: mongod
+                resources:
+                  limits:
+                    cpu: "0.2"
+                    memory: 250M
+                  requests:
+                    cpu: "0.1"
+                    memory: 200M
+              - name: mongodb-agent
+                resources:
+                  limits:
+                    cpu: "0.2"
+                    memory: 250M
+                  requests:
+                    cpu: "0.1"
+                    memory: 200M
+        volumeClaimTemplates:
+          - metadata:
+              name: data-volume
+            spec:
+              storageClassName: gp2  # AWS EKS — change for non-EKS clusters
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 10Gi
+          - metadata:
+              name: logs-volume
+            spec:
+              storageClassName: gp2  # AWS EKS — change for non-EKS clusters
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 2Gi
+
+# cert-manager: ingress TLS + internal signing certs (verifier RSA, DID EC).
+# If jetstack/cert-manager already runs cluster-wide, set `cert-manager.enabled:
+# false` but keep `certManagerResources` for the ClusterIssuer/Certificate manifests.
+cert-manager:
+  enabled: true
+certManagerResources:
+  enabled: true
+  namespace: cert-manager
+  type: "prod"
+
+# decentralizedIam:
+#   vcAuthentication  → AuthN: VC Verifier + CCS + TIL (validate VC, mint JWT)
+#   odrlAuthorization → AuthZ: APISIX + OPA + ODRL-PAP (enforce ODRL policies)
+decentralizedIam:
+  enabled: true
+
+  vcAuthentication:
+    enabled: true
+
+    # Operator installed cluster-wide; we only render the Postgresql CR below.
+    postgres-operator:
+      enabled: false
+
+    # Shared Zalando Postgres cluster for TIL/CCS/PAP/Keycloak/Scorpio.
+    # Zalando auto-creates per-user Secrets `<user>.<cluster>.credentials.postgresql.acid.zalan.do`.
+    managedPostgres:
+      enabled: true
+      config:
+        teamId: "dsc"
+        numberOfInstances: 1
+        postgresql:
+          version: "16"
+        volume:
+          size: 8Gi
+          storageClass: gp2  # AWS EKS — change for non-EKS clusters
+        users:
+          admin:    [superuser, createdb]
+          til:      [createdb]
+          ccs:      [createdb]
+          pap:      [createdb]
+          keycloak: [createdb]
+          scorpio:  [createdb, superuser]
+        databases:
+          tildb: til
+          ccsdb: ccs
+          papdb: pap
+          keycloakdb: keycloak
+          scorpio: scorpio
+        # PostGIS required by Scorpio for NGSI-LD geo queries.
+        preparedDatabases:
+          scorpio:
+            extensions:
+              postgis: public
+
+    # TIL: local "is issuer X trusted for credential Y?" service the Verifier queries.
+    # Source of truth is the dataspace TIR; ingresses off (internal-only).
+    trusted-issuers-list:
+      enabled: true
+      fullnameOverride: trusted-issuers-list
+      database:
+        persistence: true
+        dialect: POSTGRES
+        host: postgres
+        port: 5432
+        username: til
+        existingSecret:
+          enabled: true
+          name: til.postgres.credentials.postgresql.acid.zalan.do
+          key: password
+        name: tildb
+      ingress:
+        til: { enabled: false }
+        tir: { enabled: false }
+
+    # CCS: per-service config "to access X, present VC of type Y from issuer Z".
+    # `${DID}` is a runtime env var exported by `prepScript`, NOT a Helm template.
+    credentials-config-service:
+      enabled: true
+      fullnameOverride: credentials-config-service
+      ingress:
+        enabled: false
+      database:
+        persistence: true
+        dialect: POSTGRES
+        host: postgres
+        port: 5432
+        name: ccsdb
+        username: ccs
+        existingSecret:
+          enabled: true
+          name: ccs.postgres.credentials.postgresql.acid.zalan.do
+          key: password
+      registration:
+        enabled: true
+        prepScript: export DID=did:web:did-coprov.example.com:did
+        services:
+          # ── Self-issuance for the provider (LegalPersonCredential)
+          - id: ${DID}
+            defaultOidcScope: "openid learcredential"
+            authorizationType: "FRONTEND_V2"
+            oidcScopes:
+              "openid learcredential":
+                credentials:
+                  - type: LegalPersonCredential
+                    trustedParticipantsLists:
+                      - https://tir.example.com
+                    trustedIssuersLists:
+                      - http://trusted-issuers-list:8080
+                    jwtInclusion:
+                      enabled: true
+                      fullInclusion: true
+                presentationDefinition:
+                  id: pd
+                  input_descriptors:
+                    - id: descriptor
+                      constraints:
+                        fields:
+                          - id: vct
+                            path: [$.vct]
+                            filter: { const: "LegalPersonCredential" }
+                          - id: subject
+                            path: [$.firstName]
+                          - id: roles
+                            path: [$.roles]
+                      format:
+                        "vc+sd-jwt":
+                          alg: [ES256]
+                  format:
+                    "vc+sd-jwt":
+                      alg: [ES256]
+
+          # ── Operator scope for accessing Scorpio via APISIX
+          - id: data-service
+            defaultOidcScope: "operator"
+            authorizationType: "FRONTEND_V2"
+            oidcScopes:
+              "operator":
+                credentials:
+                  - type: OperatorCredential
+                    trustedParticipantsLists:
+                      - https://tir.example.com
+                    trustedIssuersLists:
+                      - http://trusted-issuers-list:8080
+                    jwtInclusion:
+                      enabled: true
+                      fullInclusion: true
+                presentationDefinition:
+                  id: pd
+                  input_descriptors:
+                    - id: descriptor
+                      constraints:
+                        fields:
+                          - id: vct
+                            path: [$.vct]
+                            filter: { const: "OperatorCredential" }
+                          - id: subject
+                            path: [$.firstName]
+                          - id: roles
+                            path: [$.roles]
+                      format:
+                        "vc+sd-jwt":
+                          alg: [ES256]
+                  format:
+                    "vc+sd-jwt":
+                      alg: [ES256]
+
+    # Verifier: OIDC endpoint that exchanges a VC for a JWT (via OID4VP).
+    # Two keys mounted:
+    #   /certs         → ECDSA TLS cert for `x509_san_dns` client identification
+    #   /certs-signing → RSA token-signing key (RSA mandatory, see keyAlgorithm below)
+    vcverifier:
+      enabled: true
+      fullnameOverride: verifier
+      m2m:
+        authEnabled: false
+      ingress:
+        enabled: true
+        className: "nginx"
+        annotations:
+          kubernetes.io/ingress.class: nginx
+          cert-manager.io/cluster-issuer: prod
+          cert-manager.io/private-key-algorithm: ECDSA
+          cert-manager.io/common-name: verifier-coprov.example.com
+        hosts:
+          - host: verifier-coprov.example.com
+            paths: ["/"]
+        tls:
+          - secretName: verifier-coprov.example.com-tls
+            hosts: [verifier-coprov.example.com]
+      deployment:
+        logging: { level: debug }
+        verifier:
+          tirAddress: http://trusted-issuers-list:8080/
+          did: did:web:did-coprov.example.com:did
+          supportedModes: [byValue, byReference]
+          generateKey: false
+          # Must be RSA — APISIX's lua-resty-openidc can't verify EC JWTs.
+          # https://github.com/zmartzone/lua-resty-openidc/pull/457
+          keyAlgorithm: RS256
+          sessionExpiry: 60
+          keyPath: /certs-signing/tls.key
+          clientIdentification:
+            kid: random-kid1
+            keyPath: /certs/tls.key
+            requestKeyAlgorithm: ES256
+            id: x509_san_dns:verifier-coprov.example.com
+            certificatePath: /certs/tls.crt
+        server:
+          host: https://verifier-coprov.example.com
+        configRepo:
+          configEndpoint: http://credentials-config-service:8080
+        additionalVolumes:
+          - name: certs-vol
+            secret:
+              secretName: verifier-coprov.example.com-tls
+          - name: signing-certs-vol
+            secret:
+              secretName: verifier-rsa-cert
+        additionalVolumeMounts:
+          - name: certs-vol
+            mountPath: /certs
+          - name: signing-certs-vol
+            mountPath: /certs-signing
+        # Auto-registers this provider's DID at the dataspace TIR.
+        # Dev/test only — in prod the operator registers participants via onboarding.
+        initContainers:
+          - name: register-at-tir
+            image: curlimages/curl:8.7.1
+            args:
+              - -v
+              - -X
+              - POST
+              - "http://tir.trust-anchor.svc.cluster.local:8080/issuer"
+              - -H
+              - "Content-Type: application/json"
+              - -d
+              - '{"did": "did:web:did-coprov.example.com:did", "credentials": []}'
+
+  # Authorization stack — request path: client → APISIX → upstream service.
+  # APISIX plugins per route: `openid-connect` (validate JWT) + `opa` (eval ODRL policy).
+  odrlAuthorization:
+    apisix:
+      admin:
+        enabled: true
+        cors: false
+        # Allow-list for APISIX admin API. CIDRs are EKS-specific; adapt to your cluster.
+        allow:
+          ipList:
+            - 127.0.0.1/24
+            - 10.100.0.0/16
+            - 172.31.0.0/16
+      etcd:
+        # 1 replica instead of chart default (3); HA not needed at this scale.
+        replicaCount: 1
+        persistence:
+          storageClass: gp2  # AWS EKS — change for non-EKS clusters
+      # Both APISIX-bundled ingress controller and Ingress disabled — we render
+      # our own nginx Ingress in `extraManifests` (chart Ingress lacks annotations).
+      ingress-controller:
+        enabled: false
+      ingress:
+        enabled: false
+      catchAllRoute:
+        enabled: false
+      # Static APISIX routes protecting the Scorpio data plane:
+      #   1. /.well-known/openid-configuration → rewritten to verifier discovery doc
+      #   2. /*                                → Scorpio, gated by openid-connect + opa
+      routes:
+        # ── mp-data-service-coprov.example.com (Scorpio NGSI-LD data plane)
+        - uri: /.well-known/openid-configuration
+          host: mp-data-service-coprov.example.com
+          upstream:
+            nodes:
+              verifier:3000: 1
+            type: roundrobin
+          plugins:
+            proxy-rewrite:
+              uri: /services/data-service/.well-known/openid-configuration
+        - uri: /*
+          host: mp-data-service-coprov.example.com
+          upstream:
+            nodes:
+              data-service-scorpio:9090: 1
+            type: roundrobin
+          plugins:
+            openid-connect:
+              bearer_only: true
+              use_jwks: true
+              client_id: data-service
+              client_secret: unused
+              ssl_verify: false
+              discovery: https://verifier-coprov.example.com/services/data-service/.well-known/openid-configuration
+            opa:
+              host: http://localhost:8181
+              policy: policy/main
+              with_body: true
+
+    # ODRL-PAP: policy admin point; exposes ODRL policies as an OPA bundle.
+    # Command is overridden to inject GENERAL_ORGANIZATION_DID (not picked up by entrypoint in 1.4.x).
+    odrl-pap:
+      enabled: true
+      fullnameOverride: odrl-pap
+      database:
+        url: jdbc:postgresql://postgres:5432/papdb
+        username: pap
+        existingSecret:
+          enabled: true
+          name: pap.postgres.credentials.postgresql.acid.zalan.do
+          key: password
+      deployment:
+        image:
+          tag: 1.4.3
+        command: [/bin/sh]
+        args:
+          - -ec
+          - |
+            #!/bin/sh
+            export GENERAL_ORGANIZATION_DID=did:web:did-coprov.example.com:did
+            ./application -Dquarkus.http.host=0.0.0.0
+      ingress:
+        enabled: false
+
+    # OPA: APISIX sidecar; polls the ODRL-PAP bundle at `resourceUrl`.
+    opa:
+      enabled: true
+      resourceUrl: http://odrl-pap:8080/bundles/service/v1
+      port: 8181
+      policies: { minDelay: 2, maxDelay: 4 }
+      methods:  { minDelay: 1, maxDelay: 3 }
+      data:     { minDelay: 1, maxDelay: 15 }
+
+    # TPP (Trusted Participants Provider): optional DID resolver against the dataspace TIR.
+    tpp:
+      enabled: false
+
+# Scorpio (NGSI-LD broker) — the data service protected by APISIX.
+# `all-in-one-runner` packs all subcomponents in one pod. No ingress: APISIX-only access.
+# `ccs.enabled: false`: Scorpio is already registered in the CCS `services[]` above.
+scorpio:
+  enabled: true
+  fullnameOverride: data-service-scorpio
+  image:
+    repository: scorpiobroker/all-in-one-runner
+    tag: java-4.1.10
+  db:
+    dbhost: postgres                     # 8.x: data-service-postgis
+    user: scorpio
+    existingSecret:
+      enabled: true
+      name: scorpio.postgres.credentials.postgresql.acid.zalan.do
+      key: password
+  additionalEnvVars:
+    - name: DBNAME
+      value: scorpio
+  ingress: { enabled: false }
+  readinessProbe: { path: /q/health }
+  livenessProbe:  { path: /q/health }
+  service: { type: ClusterIP }
+  ccs:
+    enabled: false
+    endpoint: http://credentials-config-service:8080
+
+# Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI).
+# The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
+# Bitnami moved the image to `bitnamilegacy/keycloak`; override repo + allowInsecureImages,
+# otherwise ImagePullBackOff.
+keycloak:
+  enabled: true
+  kubeVersion: 1.34-1
+  metrics: { enabled: true }
+  global:
+    security:
+      allowInsecureImages: true
+  image:
+    repository: bitnamilegacy/keycloak
+  containerSecurityContext: { enabled: false }
+  ingress:
+    pathType: Prefix
+    annotations:
+      cert-manager.io/common-name: accounts-coprov.example.com
+      cert-manager.io/cluster-issuer: prod
+      kubernetes.io/ingress.class: nginx
+    enabled: true
+    hostname: accounts-coprov.example.com
+    ingressClassName: nginx
+    tls: true
+  proxyHeaders: xforwarded
+  proxy: edge
+  tls: { enabled: false }
+  service:
+    ports: { http: 8080 }
+    extraPorts:
+      - { name: management, port: 9000, targetPort: 9000 }
+  auth:
+    existingSecret: issuance-secret
+    passwordSecretKey: keycloak-admin
+    adminUser: keycloak-admin
+  resources:
+    requests: { memory: "500Mi", cpu: "0.5" }
+    limits:   { memory: "2Gi",   cpu: "1" }
+  livenessProbe:  { failureThreshold: 20 }
+  readinessProbe: { failureThreshold: 20 }
+  postgresql: { enabled: false }
+  externalDatabase:
+    host: postgres
+    database: keycloakdb
+    user: keycloak
+    existingSecret: keycloak.postgres.credentials.postgresql.acid.zalan.do
+    existingSecretPasswordKey: password
+  extraVolumeMounts:
+    - { name: did-material, mountPath: /did-material }
+    - { name: realms,       mountPath: /opt/bitnami/keycloak/data/import }
+  extraVolumes:
+    - name: did-material
+      emptyDir: {}
+    - name: realms
+      # ConfigMap rendered by the chart from `keycloak.realm` below.
+      configMap: { name: coprov-realm }
+    - name: did-priv-key
+      secret: { secretName: did-coprov.example.com-tls }
+    - name: ca-cert
+      secret: { secretName: ca-cert }
+  # Builds a PKCS12 keystore from the cert-manager PEM keypair (Keycloak signs VCs
+  # from PKCS12, not PEM). Alias `didPrivateKey` matches `signingKey.keyAlias`.
+  initContainers:
+    - name: get-did
+      image: alpine/openssl:latest
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          openssl pkcs12 -export \
+            -in /certs-did/tls.crt \
+            -inkey /certs-did/tls.key \
+            -out /did-material/cert.pfx \
+            -certfile /ca-certs/ca.crt \
+            -name "didPrivateKey" \
+            -passout env:STORE_PASS
+          chmod 644 /did-material/cert.pfx
+      env:
+        - name: STORE_PASS
+          valueFrom:
+            secretKeyRef: { name: issuance-secret, key: store-pass }
+      volumeMounts:
+        - { name: did-material, mountPath: /did-material }
+        - { name: did-priv-key, mountPath: /certs-did }
+        - { name: ca-cert,      mountPath: /ca-certs }
+  # KC_FEATURES=oid4vc-vci   → enables the OID4VCI issuer (preview feature).
+  # --import-realm           → loads the realm JSON from `keycloak.realm` on startup.
+  # DID                      → substituted into ${DID} at realm import time.
+  extraEnvVars:
+    - name: KEYCLOAK_EXTRA_ARGS
+      value: "--import-realm --health-enabled true"
+    - name: KC_FEATURES
+      value: "oid4vc-vci"
+    - name: KC_HEAP_SIZE
+      value: "1024m"
+    - name: DID
+      value: did:web:did-coprov.example.com:did
+    - name: STORE_PASS
+      valueFrom:
+        secretKeyRef: { name: issuance-secret, key: store-pass }
+
+  # Realm structured import.
+  realm:
+    import: true
+    name: coprov
+    frontendUrl: https://accounts-coprov.example.com
+    attributes:
+      sslRequired: "none"
+
+    # Client roles per Keycloak client.
+    # ${DID}                                 → self-client (LegalPersonCredential)
+    # did:web:did-partner.example.com:did    → peer provider (OperatorCredential to consume from them)
+    clientRoles:
+      ${DID}:
+        - { name: customer,       description: "Is allowed to see offers etc.",  clientRole: true }
+        - { name: OPERATOR,       description: "Is allowed to operate clusters.", clientRole: true }
+        - { name: REPRESENTATIVE, description: "Is allowed to register.",         clientRole: true }
+        - { name: seller,         description: "Seller role",                     clientRole: true }
+        - { name: admin,          description: "Admin role",                      clientRole: true }
+      did:web:did-partner.example.com:did:
+        - { name: OPERATOR, description: "Allowed to operate the peer provider's services", clientRole: true }
+      dashboard:
+        - { name: admin,  description: "Dashboard admin",  clientRole: true }
+        - { name: viewer, description: "Dashboard viewer", clientRole: true }
+
+    # Do NOT redeclare /admin and /consumer groups: chart's `defaultGroups` already
+    # adds them and a redeclaration breaks --import-realm with a UNIQUE constraint.
+
+    users:
+      - username: employee
+        enabled: true
+        email: employee@coprov.org
+        firstName: Test
+        lastName: User
+        credentials:
+          - { type: password, value: &employee_password "test" }
+        clientRoles:
+          ${DID}: [seller, admin]
+          did:web:did-partner.example.com:did: [OPERATOR]
+          account: [view-profile, manage-account]
+          dashboard: [admin]
+        groups:
+          - /consumer
+
+    # Convention: ONE client per *target participant*, `clientId == that peer's DID`.
+    # Roles assigned on that client → emitted in the VC with `target` = that DID
+    # (via oid4vc-target-role-mapper). Add one client per peer this participant consumes from.
+    clients:
+      - clientId: ${DID}
+        enabled: true
+        description: Self client (LegalPersonCredential)
+        surrogateAuthRequired: false
+        alwaysDisplayInConsole: false
+        clientAuthenticatorType: client-secret
+        defaultRoles: []
+        redirectUris: []
+        webOrigins: []
+        notBefore: 0
+        bearerOnly: false
+        consentRequired: false
+        standardFlowEnabled: true
+        implicitFlowEnabled: false
+        directAccessGrantsEnabled: false
+        serviceAccountsEnabled: false
+        publicClient: false
+        frontchannelLogout: false
+        protocol: oid4vc
+        protocolMappers: []
+        authenticationFlowBindingOverrides: {}
+        fullScopeAllowed: true
+        nodeReRegistrationTimeout: -1
+        defaultClientScopes: []
+        optionalClientScopes: []
+      - clientId: did:web:did-partner.example.com:did
+        enabled: true
+        description: Target client for consuming the peer provider's services
+        clientAuthenticatorType: client-secret
+        defaultRoles: []
+        redirectUris: []
+        webOrigins: []
+        notBefore: 0
+        standardFlowEnabled: true
+        protocol: oid4vc
+        protocolMappers: []
+        fullScopeAllowed: true
+        nodeReRegistrationTimeout: -1
+        defaultClientScopes: []
+        optionalClientScopes: []
+
+
+    # VC types this realm issues (OID4VCI). Each entry → client scope + issuer metadata.
+    # `credential_signing_alg_values_supported` MUST match `signingKey.keyAlgorithm`
+    # and the algorithm of the key inside the PKCS12 keystore.
+    # Mappers populate `credentialSubject`:
+    #   oid4vc-context-mapper        → JSON-LD @context entries
+    #   oid4vc-user-attribute-mapper → copy Keycloak user attribute → VC claim
+    #   oid4vc-target-role-mapper    → roles on client `config.clientId`, scoped to that target DID
+    verifiableCredentials:
+
+      # Identity credential — self-issued, roles scoped to this participant's own DID.
+      legal-person-sd:
+        attributes:
+          credential_signing_alg_values_supported: ES256
+          credential_build_config.signing_algorithm: ES256
+          credential_build_config.token_jws_type: vc+sd-jwt
+          credential_build_config.proof_types_supported:
+            jwt:
+              proof_signing_alg_values_supported:
+                - ES256
+          format: vc+sd-jwt
+          scope: LegalPersonCredential
+          vct: LegalPersonCredential
+          credential_build_config.visible_claims: roles,email
+          credential_build_config.decoys: 3
+        clientScope:
+          create: true
+        protocolMappers:
+          - name: context-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-context-mapper
+            config:
+              context: https://www.w3.org/2018/credentials/v1
+              supportedCredentialTypes: LegalPersonCredential
+          - name: email-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: email
+              userAttribute: email
+              supportedCredentialTypes: LegalPersonCredential
+          - name: firstName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: firstName
+              userAttribute: firstName
+              supportedCredentialTypes: LegalPersonCredential
+          - name: lastName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: lastName
+              userAttribute: lastName
+              supportedCredentialTypes: LegalPersonCredential
+          - name: role-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-target-role-mapper
+            config:
+              subjectProperty: roles
+              clientId: ${DID}
+              supportedCredentialTypes: LegalPersonCredential
+
+      # Access credential — roles scoped to the peer provider's DID.
+      # Duplicate this block per peer you consume from, changing role-mapper.clientId.
+      operator-sd:
+        attributes:
+          credential_signing_alg_values_supported: ES256
+          credential_build_config.signing_algorithm: ES256
+          credential_build_config.token_jws_type: vc+sd-jwt
+          credential_build_config.proof_types_supported:
+            jwt:
+              proof_signing_alg_values_supported:
+                - ES256
+          format: vc+sd-jwt
+          scope: OperatorCredential
+          vct: OperatorCredential
+          credential_build_config.visible_claims: roles,email
+          credential_build_config.decoys: 3
+        clientScope:
+          create: true
+        protocolMappers:
+          - name: context-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-context-mapper
+            config:
+              context: https://www.w3.org/2018/credentials/v1
+              supportedCredentialTypes: OperatorCredential
+          - name: email-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: email
+              userAttribute: email
+              supportedCredentialTypes: OperatorCredential
+          - name: firstName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: firstName
+              userAttribute: firstName
+              supportedCredentialTypes: OperatorCredential
+          - name: lastName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: lastName
+              userAttribute: lastName
+              supportedCredentialTypes: OperatorCredential
+          - name: role-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-target-role-mapper
+            config:
+              subjectProperty: roles
+              clientId: did:web:did-partner.example.com:did
+              supportedCredentialTypes: OperatorCredential
+
+  # `keyAlgorithm` must match the PKCS12 key and `credential_signing_alg_values_supported`.
+  signingKey:
+    storePath: /did-material/cert.pfx
+    storePassword: "${STORE_PASS}"
+    keyAlias: didPrivateKey
+    keyPassword: "${STORE_PASS}"
+    keyAlgorithm: ES256
+    did: did:web:did-coprov.example.com:did
+
+# TMForum APIs (business layer for marketplace + contract-management).
+# `allInOne` = single pod instead of one per API; persisted on Scorpio (NGSI-LD).
+tm-forum-api:
+  enabled: true
+  allInOne:
+    enabled: true
+  defaultConfig:
+    serverHost: http://tm-forum-api-svc:8080
+    ngsiLd:
+      url: http://data-service-scorpio:9090
+    contextUrl: https://raw.githubusercontent.com/SEAMWARE/fdsc-edc/refs/heads/main/schemas/odrl-context.jsonld
+    additionalEnvVars:
+      - { name: API_EXTENSION_ENABLED,    value: "true" }
+      - { name: GENERAL_NGSILDORQUERYVALUE, value: "," }
+      - { name: GENERAL_NGSILDORQUERYKEY,   value: "," }
+      - { name: GENERAL_ENCLOSEQUERY,       value: "false" }
+  apiProxy: { enabled: false }
+  redis:    { enabled: false }
+  registration: { enabled: false }
+  ingress: { enabled: false }
+
+# Listens for TMForum order events, generates the ODRL policy from the offering
+# template, posts it to ODRL-PAP, and notifies the buyer with an access credential.
+contract-management:
+  enabled: true
+  enableRainbow: false
+  fullnameOverride: contract-management
+  did: did:web:did-coprov.example.com:did
+  enableCentralMarketplace: false
+  enableOdrlPap: true
+  enableTrustedIssuersList: false
+  organization:
+    provider:
+      role: seller
+  oid4vp:
+    enabled: true
+    credentialsFolder: /credential-repo
+    trustAnchors: []
+    holder:
+      holderId: did:web:did-coprov.example.com:did
+      keyType: EC
+      keyPath: /app/resources/signing-key/tls.key
+      signatureAlgorithm: ECDH-ES
+  services:
+    product-order:    { url: http://tm-forum-api-svc:8080 }
+    party:            { url: http://tm-forum-api-svc:8080 }
+    product-catalog:  { url: http://tm-forum-api-svc:8080 }
+    service-catalog:  { url: http://tm-forum-api-svc:8080 }
+    quote:            { url: http://tm-forum-api-svc:8080 }
+    odrl:             { url: http://odrl-pap:8080 }
+    trusted-issuers-list: { url: http://trusted-issuers-list:8080 }
+  til:
+    credentialType: OperatorCredential
+  notification:
+    enabled: true
+    host: contract-management
+  deployment:
+    image:
+      tag: 3.3.8
+    initContainers:
+      - name: wait-for-keycloak
+        image: curlimages/curl:8.6.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+            echo "Waiting for Keycloak to become ready..."
+            until curl -sf http://coprov-keycloak:9000/health/ready > /dev/null; do
+              echo "Keycloak not ready yet, retrying..."
+              sleep 5
+            done
+            echo "Keycloak is ready."
+      - name: get-credential
+        image: quay.io/curl/curl:8.1.2
+        command: ["/bin/sh", "-c", "/bin/get-credential.sh /credential-repo"]
+        volumeMounts:
+          - { name: credentials-script, mountPath: /bin/get-credential.sh, subPath: get-credential.sh }
+          - { name: credential-repo,    mountPath: /credential-repo }
+    additionalVolumes:
+      - name: signing-key
+        secret:
+          secretName: did-coprov.example.com-tls
+          items:
+            - { key: tls.key, path: tls.key }
+      - name: credentials-script
+        configMap: { name: credentials-script, defaultMode: 0755 }
+      - name: credential-repo
+        emptyDir: {}
+    additionalVolumeMounts:
+      - { name: credential-repo, mountPath: /credential-repo }
+      - { name: signing-key,     mountPath: /app/resources/signing-key/tls.key, subPath: tls.key }
+
+# Publishes the DID Document at https://did-coprov.example.com/did/did.json.
+# Ingress must be reachable by every dataspace peer.
+# Use `did:web` (not `did:key`) — `did:key` ties the identity to the key, blocking rotation.
+did:
+  enabled: true
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: prod
+      cert-manager.io/common-name: did-coprov.example.com
+      cert-manager.io/private-key-algorithm: ECDSA
+      cert-manager.io/private-key-encoding: PKCS8
+      kubernetes.io/ingress.class: nginx
+    hosts:
+      - host: did-coprov.example.com
+        paths:
+          - { path: /, pathType: Prefix }
+    tls:
+      - secretName: did-coprov.example.com-tls
+        hosts: [did-coprov.example.com]
+  volumes:
+    - name: certs
+      secret:
+        secretName: did-coprov.example.com-tls
+        items:
+          - { key: tls.crt, path: tls.crt }
+  volumeMounts:
+    - { name: certs, mountPath: /certs }
+  config:
+    server:
+      runServer: "true"
+      certPath: /certs/tls.crt
+      hostUrl: "https://did-coprov.example.com/did"
+      keystorePasswordSecretName: ""
+      keystorePasswordSecretKey: ""
+      keyAlias: "myAlias"
+    generateKey:
+      enabled: false
+
+# Operator UI for TIL/CCS/ODRL-PAP/APISIX. Gated by the `dashboard` Keycloak client.
+fdsc-dashboard:
+  enabled: true
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: prod
+      cert-manager.io/private-key-algorithm: ECDSA
+
+    hosts:
+      - host: dashboard-coprov.example.com
+        paths:
+          - "/"
+    tls:
+      - secretName: dashboard-coprov.example.com-tls
+        hosts:
+          - dashboard-coprov.example.com
+  apisix:
+    enabled: true
+    dashboardUrl: http://coprov-apisix-admin:9180/ui
+    adminKey: admin
+  apiUrls:
+    til: http://trusted-issuers-list:8080
+    ccs: http://credentials-config-service:8080
+    odrl: http://odrl-pap:8080
+  auth:
+    config:
+      providers:
+        - id: keycloak
+          displayName: Keycloak
+          issuer: https://accounts-coprov.example.com/realms/coprov
+          clientId: dashboard
+          scopes: ["openid", "profile", "roles"]
+          rolesClaimPath: "client_roles"
+          roleMapping:
+            admin: "admin"
+          silentRenew: true
+
+# Extra raw manifests:
+#   1. ca-cert Secret           → LE CA chain bundled into Keycloak's PKCS12.
+#   2. verifier RSA Certificate → RSA signing key for the verifier (APISIX needs RSA).
+#   3. nginx Ingress → APISIX gateway (workaround for the chart's Ingress limitations).
+extraManifests:
+  # LE CA chain bundled into the PKCS12 keystore by the Keycloak `get-did` init.
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: ca-cert
+      namespace: coprov
+    type: Opaque
+    data:
+      ca.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVWekNDQWorZ0F3SUJBZ0lSQUtwMThlWXJqd29pQ1diVGk3L1V1cUV3RFFZSktvWklodmNOQVFFTEJRQXcKVHpFTE1Ba0dBMVVFQmhNQ1ZWTXhLVEFuQmdOVkJBb1RJRWx1ZEdWeWJtVjBJRk5sWTNWeWFYUjVJRkpsYzJWaApjbU5vSUVkeWIzVndNUlV3RXdZRFZRUURFd3hKVTFKSElGSnZiM1FnV0RFd0hoY05NalF3TXpFek1EQXdNREF3CldoY05NamN3TXpFeU1qTTFPVFU1V2pBeU1Rc3dDUVlEVlFRR0V3SlZVekVXTUJRR0ExVUVDaE1OVEdWMEozTWcKUlc1amNubHdkREVMTUFrR0ExVUVBeE1DUlRjd2RqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVJCNkFTVApDRmgvdmpjd0RNQ2dRZXIrVnRxRWt6N0pBTnVyWnhMUCtVOVRDZWlvTDZzcDVaOFZSdlJiWWs0UDFJTkJtYmVmClFISkZIQ3hjU2pLbXd0dkdCV3BsLzlyYThIVzBRRHNVYUpXMnFPSnFjZUowWlZGVDNoYlVIaWZCTS8yamdmZ3cKZ2ZVd0RnWURWUjBQQVFIL0JBUURBZ0dHTUIwR0ExVWRKUVFXTUJRR0NDc0dBUVVGQndNQ0JnZ3JCZ0VGQlFjRApBVEFTQmdOVkhSTUJBZjhFQ0RBR0FRSC9BZ0VBTUIwR0ExVWREZ1FXQkJTdVNKN2NoeDFFb0cvYW91VmdkQVI0Cndwd0FnREFmQmdOVkhTTUVHREFXZ0JSNXRGbm1lN2JsNUFGemdBaUl5QnBZOXVtYmJqQXlCZ2dyQmdFRkJRY0IKQVFRbU1DUXdJZ1lJS3dZQkJRVUhNQUtHRm1oMGRIQTZMeTk0TVM1cExteGxibU55TG05eVp5OHdFd1lEVlIwZwpCQXd3Q2pBSUJnWm5nUXdCQWdFd0p3WURWUjBmQkNBd0hqQWNvQnFnR0lZV2FIUjBjRG92TDNneExtTXViR1Z1ClkzSXViM0puTHpBTkJna3Foa2lHOXcwQkFRc0ZBQU9DQWdFQWp4NjZmRGRMazV5d0ZuM0N6QTF3MXFmeWxIVUQKYUVmMFFacFhjSnNlZGRKR1NmYlVVT3ZiTlI5Ti9RUTE2SzFsWGw0VkZ5aG1HWERUNUtkZmNyMFJ2SUlWck54RgpoNGxxSHRSUkNQNlJCUnN0cWJaMnpVUmdxYWtuL1hpcDBpYVFMMElkZkhCWnIzOTZGZ2tubmlSWUZja0tPUlBHCnlNM1FLbmQ2Nmd0TXN0OEk1bmtSUWxBZy9KYitHYzNlZ0l2dUdLV2JvRTFHODlOVHNOOUxUREQzUExqMGRVTXIKT0l1cVZqTEI4cEVDNnlrOWVucmxycWpYUWdrTEVZaFh6cTdkTGFmdjVWa2lnNkdsMG51dXFqcWZwMFExYmkxbwp5Vk5BbFhlNmFVWHc5MkNjZ2hDOWJOc0tFTzErTTUyWVk1K29mSVhsUy9TRVFidlZZWUJMWjV5ZWlnbFY2dDNTCk02SCt2VEcwYVA5WUh6TG4vS1ZPSHpHUWZYRFA3cU01dGtmKzdkaVplN28yZnc2TzdJdk42ZnNRWEVRUWo4VEoKVVhKeHYyL3VKaGN1eS90U0RnWHdITThVazM0V05iUlQ3ekdUR2tRUlgwZ3NiakFlYS9qWUFvV3YwWnZRUndwcQpQZTc5RC9pN0NlcDhxV25BKzdBRS8zQjNTLzNkRUVZbWMwbHBlMTM2NkEvNkdFZ2sza3RyOVBFb1FyTENoczZJCnR1M3duTkxCMmV1QzhJS0dMUUZwR3RPTy8yL2hpQUtqeWFqYUJQMjV3MWpGMFdsOEJicW5lM3VaMnExR3lQRkoKWVJtVDcvT1hwbU9IL0ZWTHR3Uys4bmcxY0FtcEN1nginx3dGVKWk5jREcwc0Yybi9zYzArU1FmNDlmZHlVSzB0eQorVlV3Rmo5dG1XeHlSL009Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KCi0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpNSUlGYXpDQ0ExT2dBd0lCQWdJUkFJSVF6N0RTUU9OWlJHUGd1Mk9DaXdBd0RRWUpLb1pJaHZjTkFRRUxCUUF3ClR6RUxNQWtHQTFVRUJoTUNWVk14S1RBbkJnTlZCQW9USUVsdWRHVnlibVYwSUZObFkzVnlhWFI1SUZKbGMyVmgKY21Ob0lFZHliM1Z3TVJVd0V3WURWUVFERXd4SlUxSkhJRkp2YjNRZ1dERXdIaGNOTVRVd05qQTBNVEV3TkRNNApXaGNOTXpVd05qQTBNVEV3TkRNNFdqQlBNUXN3Q1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1ClpYUWdVMlZqZFhKcGRIa2dVbVZ6WldGeVkyZ2dSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQlkKTVRDQ0FpSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnSVBBRENDQWdvQ2dnSUJBSzNvSkhQMEZEZnptNTRyVnlnYwpoNzdjdDk4NGtJeHVQT1pYb0hqM2RjS2kvdlZxYnZZQVR5amIzbWlHYkVTVHRyRmovUlFTYTc4ZjB1b3hteUYrCjBUTTh1a2oxM1huZnM3ai9FdkVobWt2QmlvWnhhVXBtWm15UGZqeHd2NjBwSWdiejVNRG1nSzdpUzQrM21YNlUKQTUvVFI1ZDhtVWdqVStnNHJrOEtiNE11MFVsWGpJQjB0dG92MERpTmV3TndJUnQxOGpBOCtvK3UzZHBqcStzVwpUOEtPRVV0K3p3dm8vN1YzTHZTeWUwcmdUQklsREhDTkF5bWc0Vk1rN0JQWjdobS9FTE5LakQrSm8yRlIzcXlICkI1VDBZM0hzTHVKdlc1aUI0WWxjTkhsc2R1ODdrR0o1NXR1a21pOG14ZEFRNFE3ZTJSQ09GdnUzOTZqM3grVUMKQjVpUE5naVY1K0kzbGcwMmRaNzdEbkt4SFp1OEEvbEpCZGlCM1FXMEt0WkI2YXdCZHBVS0Q5amYxYjBTSHpVdgpLQmRzMHBqQnFBbGtkMjVITjdyT3JGbGVhSjEvY3RhSnhRWkJLVDVaUHQwbTlTVEpFYWRhbzB4QUgwYWhtYlduCk9sRnVoanVlZlhLbkVnVjRXZTArVVhnVkN3T1BqZEF2QmJJK2Uwb2NTM01GRXZ6RzZ1QlFFM3hEazNTenluVG4Kamg4QkNOQXcxRnR4TnJRSHVzRXdNRnhJdDRJN21LWjlZSXFpb3ltQ3pMcTlnd1Fib29NRFFhSFdCZkVid3JidwpxSHlHTzBhb1NDcUkzSGFhZHI4ZmFxVTlHWS9yT1BOazNzZ3JEUW9vLy9mYjRoVkMxQ0xRSjEzaGVmNFk1M0NJCnJVN20yWXM2eHQwblVXNy92R1QxTTBOUEFnTUJBQUdqUWpCQU1BNEdBMVVkRHdFQi93UUVBd0lCQmpBUEJnTlYKSFJNQkFmOEVCVEFEQVFIL01CMEdBMVVkRGdRV0JCUjV0Rm5tZTdibDVBRnpnQWlJeUJwWTl1bWJiakFOQmdrcQpoa2lHOXcwQkFRc0ZBQU9DQWdFQVZSOVlxYnl5cUZEUURMSFlHbWtnSnlrSXJHRjFYSXB1K0lMbGFTL1Y5bFpMCnViaHpFRm5USVpkKzUweHgrN0xTWUswNXFBdnFGeUZXaGZGUURsbnJ6dUJaNmJySkZlK0duWStFZ1BiazZaR1EKM0JlYllodEY4R2FWMG54dnd1bzc3eC9QeTlhdUovR3BzTWl1L1gxK212b2lCT3YvMlgvcWtTc2lzUmNPai9LSwpORnRZMlB3QnlWUzV1Q2JNaW9nemlVd3RoRHlDMys2V1Z3VzZMTHYzeExmSFRqdUN2akhJSW5Oemt0SENnS1E1Ck9SQXpJNEpNUEorR3NsV1lIYjRwaG93aW01N2lhenRYT29Kd1Rkd0p4NG5MQ2dkTmJPaGRqc252enF2SHU3VXIKVGtYV1N0QW16T1Z5eWdocXBaWGpGYUgzcE8zSkxGK2wrLytzS0FJdXZ0ZDd1K054ZTVBVzB3ZGVSbE44TndkQwpqTlBFbHB6Vm1iVXE0SlVhZ0VpdVREa0h6c3hIcEZLVks3cTQrNjNTTTFOOTVSMU5iZFdoc2NkQ2IrWkFKelZjCm95aTNCNDNualRPUTV5T2YrMUNjZVd4RzFiUVZzNVp1ZnBzTWxqcTRVaTAvMWx2aCt3akNoUDRrcUtPSjJxeHEKNFJncXNhaERZVnZUSDl3N2pYYnlMZWlOZGQ4WE0ydzlVL3Q3eTBGZi85eWkwR0U0NFphNHJGMkxOOWQxMVRQQQptUkd1blVIQmNuV0V2Z0pCUWw5bkpFaVUwWnNudmdjL3ViaFBnWFJSNFhxMzdaMGo0cjdnMVNnRUV6d3hBNTdkCmVteVB4Z2NZeG4vZVI0NC9LSjRFQnMrbFZEUjN2ZXlKbStrWFE5OWIyMS8ramg1WG9zMUFuWDVpSXRyZUdDYz0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQoKLS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNHekNDQWFHZ0F3SUJBZ0lRUWRLZDBYTHE3cWVBd1N4czZTK0hVakFLQmdncWhrak9QUVFEQXpCUE1Rc3cKQ1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1WlhRZ1UyVmpkWEpwZEhrZ1VtVnpaV0Z5WTJnZwpSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQllNakFlRncweU1EQTVNRFF3TURBd01EQmFGdzAwCk1EQTVNVGN4TmpBd01EQmFNRTh4Q3pBSkJnTlZCQVlUQWxWVE1Ta3dKd1lEVlFRS0V5QkpiblJsY201bGRDQlQKWldOMWNtbDBlU0JTWlhObFlYSmphQ0JIY205MWNERVZNQk1HQTFVRUF4TU1TVk5TUnlCU2IyOTBJRmd5TUhZdwpFQVlIS29aSXpqMENBUVlGSzRFRUFDSURZZ0FFelp2Vm40Q0RDdXdKU3ZNV1NqNWN6M2VzM21jRkRSMEh0dHdXCisxcUxGTnZpY1dERXVrV1ZFWW1PNmdiZjl5b1dIS1M1eGNVeTRBUGdIb0lZT0l2WFJkZ0thbTdtQUhmN0FsRjkKSXRnS2JwcGJkOS93K2tIc09keDF5bWdIREIvcW8wSXdRREFPQmdOVkhROEJBZjhFQkFNQ0FRWXdEd1lEVlIwVApBUUgvQkFVd0F3RUIvekFkQmdOVkhRNEVGZ1FVZkVLV3J0NUxTRHY2a3ZpZWpNOXRpNmx5TjVVd0NnWUlLb1pJCnpqMEVBd01EYUFBd1pRSXdlM2xPUmxDRXdrU0hSaHRGY1A5WW1kNzAvYVRTVmFZZ0xYVFdOTHhCbzFCZkFTZFcKdEw0bmRRYXZFaTUxbUkzOEFqRUFpL1YzYk5USVphcmdDeXp1Rkowbk42VDVVNlZSNUNtRDEvaVFNVnRDbndyMQovcTRBYU9lTVNRKzJiMXRiRmZMbgotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0t
+
+  # RSA cert for the verifier's JWT signing (mounted as volume `signing-certs-vol`).
+  - apiVersion: cert-manager.io/v1
+    kind: Certificate
+    metadata:
+      name: verifier-internal-rsa-cert
+      namespace: coprov
+    spec:
+      commonName: verifier-coprov.example.com
+      dnsNames:
+        - verifier-coprov.example.com
+      issuerRef:
+        group: cert-manager.io
+        kind: ClusterIssuer
+        name: prod
+      privateKey:
+        algorithm: RSA
+      secretName: verifier-rsa-cert
+      usages:
+        - key encipherment
+
+  - apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: coprov-apisix
+      namespace: coprov
+      annotations:
+        kubernetes.io/ingress.class: nginx
+        cert-manager.io/cluster-issuer: prod
+        cert-manager.io/private-key-algorithm: ECDSA
+    spec:
+      ingressClassName: nginx
+      rules:
+        - host: mp-data-service-coprov.example.com
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: coprov-apisix-gateway
+                    port:
+                      number: 80
+      tls:
+        - secretName: mp-data-service-coprov.example.com-tls
+          hosts:
+            - mp-data-service-coprov.example.com
+
+# Marketplace (BAE) — web storefront + order pipeline on top of TMForum APIs.
+# Subcharts:
+#   bizEcosystemLogicProxy        → UI + API gateway (only one with Ingress)
+#   bizEcosystemChargingBackend   → pricing/billing/invoicing
+#   bizEcosystemApis              → BAE ↔ TMForum API adapter
+# Login is VC-based via SIOP against this provider's own Verifier.
+marketplace:
+  enabled: true
+  generatePasswords: false
+
+  # SIOP login flow: marketplace renders QR (host+qrCodePath) → user presents VC at
+  # the Verifier → JWT posted to tokenPath → validated against jwksPath.
+  # `clientId` reuses the provider DID. `allowedRoles` is the post-token AuthZ filter.
+  siop:
+    clientId: did:web:did-coprov.example.com:did
+    verifier:
+      host: https://verifier-coprov.example.com
+      qrCodePath: /api/v2/loginQR
+      tokenPath: /token
+      jwksPath: /.well-known/jwks
+    allowedRoles:
+      - seller
+      - customer
+      - admin
+  # Public URL — must match `bizEcosystemLogicProxy.ingress` host (used in redirects/emails).
+  externalUrl: https://marketplace-coprov.example.com
+
+  # Billing/pricing engine. Wired to local TMForum CustomerBill + Party APIs.
+  bizEcosystemChargingBackend:
+    deployment:
+      image:
+        tag: 11.4.0
+      livenessProbe:
+        initialDelaySeconds: 20
+      readinessProbe:
+        initialDelaySeconds: 20
+    extraEnvVars:
+      - name: BAE_CB_CUSTOMER_BILL
+        value: "http://tm-forum-api-svc:8080/tmf-api/customerBillManagement/v4"
+      - name: BAE_CB_PARTY
+        value: "http://tm-forum-api-svc:8080/tmf-api/party/v4"
+
+  # BAE → TMForum adapter. All entries point at the local all-in-one tm-forum-api-svc;
+  # split per-Service if you deploy TMForum as separate microservices.
+  bizEcosystemApis:
+    deployment:
+      livenessProbe:
+        initialDelaySeconds: 20
+      readinessProbe:
+        initialDelaySeconds: 20
+    tmForum:
+      catalog:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/productCatalogManagement/v4
+      inventory:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/productInventory/v4
+      ordering:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/productOrderingManagement/v4
+      billing:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/accountManagement/v4
+      usage:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/usageManagement/v4
+      party:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/party/v4
+      customer:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/customerManagement/v4
+      resources:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/resourceCatalog/v4
+      services:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/serviceCatalogManagement/v4
+      resourceInventory:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/resourceInventoryManagement/v4
+      serviceInventory:
+        host: tm-forum-api-svc
+        port: 8080
+        path: /tmf-api/serviceInventory/v4
+
+  # User-facing UI + API gateway. StatefulSet (on-disk session state).
+  # Only marketplace component with an Ingress.
+  bizEcosystemLogicProxy:
+    statefulset:
+      livenessProbe:
+        initialDelaySeconds: 20
+      readinessProbe:
+        initialDelaySeconds: 20
+      image:
+        tag: 11.15.0
+    ingress:
+      enabled: true
+      className: nginx
+      annotations:
+        cert-manager.io/cluster-issuer: "prod"
+        cert-manager.io/private-key-algorithm: "ECDSA"
+        cert-manager.io/common-name: "marketplace-coprov.example.com"
+        kubernetes.io/ingress.class: "nginx"
+      hosts:
+        - host: marketplace-coprov.example.com
+          paths:
+            - "/"
+      tls:
+        - secretName: marketplace-coprov.example.com-tls
+          hosts:
+            - marketplace-coprov.example.com
+    # Mount the DID private key (used to sign SIOP requests).
+    extraVolumeMounts:
+      - name: did-priv-key
+        mountPath: /certs-did
+    extraContainerVolumes:
+      - name: did-priv-key
+        secret:
+          secretName: did-coprov.example.com-tls
+
+    # BAE_LP_SIOP_IS_REDIRECTION → redirect-based SIOP (vs QR)
+    # BAE_LP_PURCHASE_ENABLED    → enable buy flow
+    # BAE_LP_BILLING_ENGINE_URL  → in-cluster charging backend; svc name = <release>-biz-ecosystem-charging-backend
+    # BAE_LP_DATASPACE_ENABLED   → enable TIL/VC extensions
+    # BAE_LP_SIOP_PRIVATE_KEY_PEM→ DID private key path
+    additionalEnvVars:
+      - name: BAE_LP_SIOP_IS_REDIRECTION
+        value: "true"
+      - name: BAE_LP_PURCHASE_ENABLED
+        value: "true"
+      - name: BAE_LP_BILLING_ENGINE_URL
+        value: "http://coprov-biz-ecosystem-charging-backend.coprov.svc.cluster.local:8006/charging/api/orderManagement/orders/preview/"
+      - name: BAE_LP_DATASPACE_ENABLED
+        value: "true"
+      - name: BAE_LP_SIOP_PRIVATE_KEY_PEM
+        value: /certs-did/tls.key
+
+# Disabled subcharts:
+#   vault            → using sealed-secrets instead
+#   fdsc-edc/identityhub → Eclipse Dataspace Components (we use OID4VP only)
+#   elsi             → Gaia-X compliance overlay (per-env overlay)
+#   rainbow          → alternative authz stack (we use ODRL+OPA)
+#   dataSpaceConfig/registration/credentials → first-install bootstrap helpers
+vault:            { enabled: false }
+fdsc-edc:         { enabled: false }
+identityhub:      { enabled: false }
+elsi:             { enabled: false }
+rainbow:          { enabled: false }
+dataSpaceConfig:  { enabled: false }
+registration:     { enabled: false }
+credentials:      { enabled: false }
+
