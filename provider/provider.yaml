@@ -74,6 +74,46 @@ certManagerResources:
   namespace: cert-manager
   type: "prod"
 
+# Publishes the DID Document at https://did-provider.example.com/did/did.json.
+# Ingress must be reachable by every dataspace peer.
+# Use `did:web` (not `did:key`) — `did:key` ties the identity to the key, blocking rotation.
+did:
+  enabled: true
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: prod
+      cert-manager.io/common-name: did-provider.example.com
+      cert-manager.io/private-key-algorithm: ECDSA
+      cert-manager.io/private-key-encoding: PKCS8
+      kubernetes.io/ingress.class: nginx
+    hosts:
+      - host: did-provider.example.com
+        paths:
+          - { path: /, pathType: Prefix }
+    tls:
+      - secretName: did-provider.example.com-tls
+        hosts: [did-provider.example.com]
+  volumes:
+    - name: certs
+      secret:
+        secretName: did-provider.example.com-tls
+        items:
+          - { key: tls.crt, path: tls.crt }
+  volumeMounts:
+    - { name: certs, mountPath: /certs }
+  config:
+    server:
+      runServer: "true"
+      certPath: /certs/tls.crt
+      hostUrl: "https://did-provider.example.com/did"
+      keystorePasswordSecretName: ""
+      keystorePasswordSecretKey: ""
+      keyAlias: "myAlias"
+    generateKey:
+      enabled: false
+
 # decentralizedIam:
 #   vcAuthentication  → AuthN: VC Verifier + CCS + TIL (validate VC, mint JWT)
 #   odrlAuthorization → AuthZ: APISIX + OPA + ODRL-PAP (enforce ODRL policies)
@@ -83,9 +123,8 @@ decentralizedIam:
   vcAuthentication:
     enabled: true
 
-    # Operator installed cluster-wide; we only render the Postgresql CR below.
     postgres-operator:
-      enabled: false
+      enabled: true
 
     # Shared Zalando Postgres cluster for TIL/CCS/PAP/Keycloak/Scorpio.
     # Zalando auto-creates per-user Secrets `<user>.<cluster>.credentials.postgresql.acid.zalan.do`.
@@ -160,7 +199,6 @@ decentralizedIam:
         enabled: true
         prepScript: export DID=did:web:did-provider.example.com:did
         services:
-          # ── Self-issuance for the provider (LegalPersonCredential)
           - id: ${DID}
             defaultOidcScope: "openid learcredential"
             authorizationType: "FRONTEND_V2"
@@ -195,7 +233,6 @@ decentralizedIam:
                     "vc+sd-jwt":
                       alg: [ES256]
 
-          # ── Operator scope for accessing Scorpio via APISIX
           - id: data-service
             defaultOidcScope: "operator"
             authorizationType: "FRONTEND_V2"
@@ -426,244 +463,6 @@ scorpio:
     enabled: false
     endpoint: http://credentials-config-service:8080
 
-# Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI).
-# The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
-# Bitnami moved the image to `bitnamilegacy/keycloak`; override repo + allowInsecureImages,
-# otherwise ImagePullBackOff.
-keycloak:
-  enabled: true
-  kubeVersion: 1.34-1
-  metrics: { enabled: true }
-  global:
-    security:
-      allowInsecureImages: true
-  image:
-    repository: bitnamilegacy/keycloak
-  containerSecurityContext: { enabled: false }
-  ingress:
-    pathType: Prefix
-    annotations:
-      cert-manager.io/common-name: accounts.example.com
-      cert-manager.io/cluster-issuer: prod
-      kubernetes.io/ingress.class: nginx
-    enabled: true
-    hostname: accounts.example.com
-    ingressClassName: nginx
-    tls: true
-  proxyHeaders: xforwarded
-  proxy: edge
-  tls: { enabled: false }
-  service:
-    ports: { http: 8080 }
-    extraPorts:
-      - { name: management, port: 9000, targetPort: 9000 }
-  auth:
-    existingSecret: issuance-secret
-    passwordSecretKey: keycloak-admin
-    adminUser: keycloak-admin
-  resources:
-    requests: { memory: "500Mi", cpu: "0.5" }
-    limits:   { memory: "2Gi",   cpu: "1" }
-  livenessProbe:  { failureThreshold: 20 }
-  readinessProbe: { failureThreshold: 20 }
-  postgresql: { enabled: false }
-  externalDatabase:
-    host: postgres
-    database: keycloakdb
-    user: keycloak
-    existingSecret: keycloak.postgres.credentials.postgresql.acid.zalan.do
-    existingSecretPasswordKey: password
-  extraVolumeMounts:
-    - { name: did-material, mountPath: /did-material }
-    - { name: realms,       mountPath: /opt/bitnami/keycloak/data/import }
-  extraVolumes:
-    - name: did-material
-      emptyDir: {}
-    - name: realms
-      # ConfigMap rendered by the chart from `keycloak.realm` below.
-      configMap: { name: provider-realm }
-    - name: did-priv-key
-      secret: { secretName: did-provider.example.com-tls }
-    - name: ca-cert
-      secret: { secretName: ca-cert }
-  # Builds a PKCS12 keystore from the cert-manager PEM keypair (Keycloak signs VCs
-  # from PKCS12, not PEM). Alias `didPrivateKey` matches `signingKey.keyAlias`.
-  initContainers:
-    - name: get-did
-      image: alpine/openssl:latest
-      command: ["/bin/sh", "-c"]
-      args:
-        - |
-          openssl pkcs12 -export \
-            -in /certs-did/tls.crt \
-            -inkey /certs-did/tls.key \
-            -out /did-material/cert.pfx \
-            -certfile /ca-certs/ca.crt \
-            -name "didPrivateKey" \
-            -passout env:STORE_PASS
-          chmod 644 /did-material/cert.pfx
-      env:
-        - name: STORE_PASS
-          valueFrom:
-            secretKeyRef: { name: issuance-secret, key: store-pass }
-      volumeMounts:
-        - { name: did-material, mountPath: /did-material }
-        - { name: did-priv-key, mountPath: /certs-did }
-        - { name: ca-cert,      mountPath: /ca-certs }
-  # KC_FEATURES=oid4vc-vci   → enables the OID4VCI issuer (preview feature).
-  # --import-realm           → loads the realm JSON from `keycloak.realm` on startup.
-  # DID                      → substituted into ${DID} at realm import time.
-  extraEnvVars:
-    - name: KEYCLOAK_EXTRA_ARGS
-      value: "--import-realm --health-enabled true"
-    - name: KC_FEATURES
-      value: "oid4vc-vci"
-    - name: KC_HEAP_SIZE
-      value: "1024m"
-    - name: DID
-      value: did:web:did-provider.example.com:did
-    - name: STORE_PASS
-      valueFrom:
-        secretKeyRef: { name: issuance-secret, key: store-pass }
-
-  # Realm structured import.
-  realm:
-    import: true
-    name: provider
-    frontendUrl: https://accounts.example.com
-    attributes:
-      sslRequired: "none"
-
-    # Client roles per Keycloak client. `${DID}` is the self-client.
-    clientRoles:
-      ${DID}:
-        - { name: customer,       description: "Is allowed to see offers etc.",  clientRole: true }
-        - { name: OPERATOR,       description: "Is allowed to operate clusters.", clientRole: true }
-        - { name: REPRESENTATIVE, description: "Is allowed to register.",         clientRole: true }
-        - { name: seller,         description: "Seller role",                     clientRole: true }
-        - { name: admin,          description: "Admin role",                      clientRole: true }
-      dashboard:
-        - { name: admin,  description: "Dashboard admin",  clientRole: true }
-        - { name: viewer, description: "Dashboard viewer", clientRole: true }
-
-    # Do NOT redeclare /admin and /consumer groups: chart's `defaultGroups` already
-    # adds them and a redeclaration breaks --import-realm with a UNIQUE constraint.
-
-    users:
-      - username: employee
-        enabled: true
-        email: employee@provider.org
-        firstName: Test
-        lastName: User
-        credentials:
-          - { type: password, value: "test" }
-        clientRoles:
-          ${DID}: [seller, admin]
-          account: [view-profile, manage-account]
-          dashboard: [admin]
-        groups:
-          - /consumer
-
-    # Convention: ONE client per *target participant*, `clientId == that peer's DID`.
-    # Roles assigned on that client → emitted in the VC with `target` = that DID
-    # (via oid4vc-target-role-mapper). Here we only declare the self-client (${DID}).
-    clients:
-      - clientId: ${DID}
-        enabled: true
-        description: Client to manage itself
-        surrogateAuthRequired: false
-        alwaysDisplayInConsole: false
-        clientAuthenticatorType: client-secret
-        defaultRoles: []
-        redirectUris: []
-        webOrigins: []
-        notBefore: 0
-        bearerOnly: false
-        consentRequired: false
-        standardFlowEnabled: true
-        implicitFlowEnabled: false
-        directAccessGrantsEnabled: false
-        serviceAccountsEnabled: false
-        publicClient: false
-        frontchannelLogout: false
-        protocol: oid4vc
-        protocolMappers: []
-        authenticationFlowBindingOverrides: {}
-        fullScopeAllowed: true
-        nodeReRegistrationTimeout: -1
-        defaultClientScopes: []
-        optionalClientScopes: []
-
-
-    # VC types this realm issues (OID4VCI). Each entry → client scope + issuer metadata.
-    # `credential_signing_alg_values_supported` MUST match `signingKey.keyAlgorithm`
-    # and the algorithm of the key inside the PKCS12 keystore.
-    # Mappers populate `credentialSubject`:
-    #   oid4vc-context-mapper        → JSON-LD @context entries
-    #   oid4vc-user-attribute-mapper → copy Keycloak user attribute → VC claim
-    #   oid4vc-target-role-mapper    → roles on client `config.clientId`, scoped to that target DID
-    verifiableCredentials:
-      user-sd:
-        attributes:
-          credential_signing_alg_values_supported: ES256
-          credential_build_config.signing_algorithm: ES256
-          credential_build_config.token_jws_type: vc+sd-jwt
-          credential_build_config.proof_types_supported:
-            jwt:
-              proof_signing_alg_values_supported:
-                - ES256
-          format: vc+sd-jwt
-          scope: LegalPersonCredential
-          vct: LegalPersonCredential
-          credential_build_config.visible_claims: roles,email
-          credential_build_config.decoys: 3
-        clientScope:
-          create: true
-        protocolMappers:
-          - name: context-mapper
-            protocol: oid4vc
-            protocolMapper: oid4vc-context-mapper
-            config:
-              context: https://www.w3.org/2018/credentials/v1
-              supportedCredentialTypes: LegalPersonCredential
-          - name: email-mapper
-            protocol: oid4vc
-            protocolMapper: oid4vc-user-attribute-mapper
-            config:
-              subjectProperty: email
-              userAttribute: email
-              supportedCredentialTypes: LegalPersonCredential
-          - name: firstName-mapper
-            protocol: oid4vc
-            protocolMapper: oid4vc-user-attribute-mapper
-            config:
-              subjectProperty: firstName
-              userAttribute: firstName
-              supportedCredentialTypes: LegalPersonCredential
-          - name: lastName-mapper
-            protocol: oid4vc
-            protocolMapper: oid4vc-user-attribute-mapper
-            config:
-              subjectProperty: lastName
-              userAttribute: lastName
-              supportedCredentialTypes: LegalPersonCredential
-          - name: role-mapper
-            protocol: oid4vc
-            protocolMapper: oid4vc-target-role-mapper
-            config:
-              subjectProperty: roles
-              clientId: ${DID}
-              supportedCredentialTypes: LegalPersonCredential
-
-  # `keyAlgorithm` must match the PKCS12 key and `credential_signing_alg_values_supported`.
-  signingKey:
-    storePath: /did-material/cert.pfx
-    storePassword: "${STORE_PASS}"
-    keyAlias: didPrivateKey
-    keyPassword: "${STORE_PASS}"
-    keyAlgorithm: ES256
-    did: did:web:did-provider.example.com:did
-
 # TMForum APIs (business layer for marketplace + contract-management).
 # `allInOne` = single pod instead of one per API; persisted on Scorpio (NGSI-LD).
 tm-forum-api:
@@ -683,222 +482,6 @@ tm-forum-api:
   redis:    { enabled: false }
   registration: { enabled: false }
   ingress: { enabled: false }
-
-# Listens for TMForum order events, generates the ODRL policy from the offering
-# template, posts it to ODRL-PAP, and notifies the buyer with an access credential.
-contract-management:
-  enabled: true
-  enableRainbow: false
-  fullnameOverride: contract-management
-  did: did:web:did-provider.example.com:did
-  enableCentralMarketplace: false
-  enableOdrlPap: true
-  enableTrustedIssuersList: false
-  organization:
-    provider:
-      role: seller
-  oid4vp:
-    enabled: true
-    credentialsFolder: /credential-repo
-    trustAnchors: []
-    holder:
-      holderId: did:web:did-provider.example.com:did
-      keyType: EC
-      keyPath: /app/resources/signing-key/tls.key
-      signatureAlgorithm: ECDH-ES
-  services:
-    product-order:    { url: http://tm-forum-api-svc:8080 }
-    party:            { url: http://tm-forum-api-svc:8080 }
-    product-catalog:  { url: http://tm-forum-api-svc:8080 }
-    service-catalog:  { url: http://tm-forum-api-svc:8080 }
-    quote:            { url: http://tm-forum-api-svc:8080 }
-    odrl:             { url: http://odrl-pap:8080 }
-    trusted-issuers-list: { url: http://trusted-issuers-list:8080 }
-  til:
-    credentialType: OperatorCredential
-  notification:
-    enabled: true
-    host: contract-management
-  deployment:
-    image:
-      tag: 3.3.8
-    initContainers:
-      - name: wait-for-keycloak
-        image: curlimages/curl:8.6.0
-        command: [sh, -c]
-        args:
-          - |
-            set -e
-            echo "Waiting for Keycloak to become ready..."
-            # Service name is <helm-release>-keycloak. Update if release != `provider`.
-            until curl -sf http://provider-keycloak:9000/health/ready > /dev/null; do
-              echo "Keycloak not ready yet, retrying..."
-              sleep 5
-            done
-            echo "Keycloak is ready."
-      - name: get-credential
-        image: quay.io/curl/curl:8.1.2
-        command: ["/bin/sh", "-c", "/bin/get-credential.sh /credential-repo"]
-        volumeMounts:
-          - { name: credentials-script, mountPath: /bin/get-credential.sh, subPath: get-credential.sh }
-          - { name: credential-repo,    mountPath: /credential-repo }
-    additionalVolumes:
-      - name: signing-key
-        secret:
-          secretName: did-provider.example.com-tls
-          items:
-            - { key: tls.key, path: tls.key }
-      - name: credentials-script
-        configMap: { name: credentials-script, defaultMode: 0755 }
-      - name: credential-repo
-        emptyDir: {}
-    additionalVolumeMounts:
-      - { name: credential-repo, mountPath: /credential-repo }
-      - { name: signing-key,     mountPath: /app/resources/signing-key/tls.key, subPath: tls.key }
-
-# Publishes the DID Document at https://did-provider.example.com/did/did.json.
-# Ingress must be reachable by every dataspace peer.
-# Use `did:web` (not `did:key`) — `did:key` ties the identity to the key, blocking rotation.
-did:
-  enabled: true
-  ingress:
-    enabled: true
-    className: nginx
-    annotations:
-      cert-manager.io/cluster-issuer: prod
-      cert-manager.io/common-name: did-provider.example.com
-      cert-manager.io/private-key-algorithm: ECDSA
-      cert-manager.io/private-key-encoding: PKCS8
-      kubernetes.io/ingress.class: nginx
-    hosts:
-      - host: did-provider.example.com
-        paths:
-          - { path: /, pathType: Prefix }
-    tls:
-      - secretName: did-provider.example.com-tls
-        hosts: [did-provider.example.com]
-  volumes:
-    - name: certs
-      secret:
-        secretName: did-provider.example.com-tls
-        items:
-          - { key: tls.crt, path: tls.crt }
-  volumeMounts:
-    - { name: certs, mountPath: /certs }
-  config:
-    server:
-      runServer: "true"
-      certPath: /certs/tls.crt
-      hostUrl: "https://did-provider.example.com/did"
-      keystorePasswordSecretName: ""
-      keystorePasswordSecretKey: ""
-      keyAlias: "myAlias"
-    generateKey:
-      enabled: false
-
-# Operator UI for TIL/CCS/ODRL-PAP/APISIX. Gated by the `dashboard` Keycloak client.
-fdsc-dashboard:
-  enabled: true
-  ingress:
-    enabled: true
-    className: nginx
-    annotations:
-      kubernetes.io/ingress.class: nginx
-      cert-manager.io/cluster-issuer: prod
-      cert-manager.io/private-key-algorithm: ECDSA
-
-    hosts:
-      - host: dashboard-provider.example.com
-        paths:
-          - "/"
-    tls:
-      - secretName: dashboard-provider.example.com-tls
-        hosts:
-          - dashboard-provider.example.com
-  apisix:
-    enabled: true
-    # Service name is <helm-release>-apisix-admin. Update if release != `provider`.
-    dashboardUrl: http://provider-apisix-admin:9180/ui
-    adminKey: admin
-  apiUrls:
-    til: http://trusted-issuers-list:8080
-    ccs: http://credentials-config-service:8080
-    odrl: http://odrl-pap:8080
-  auth:
-    config:
-      providers:
-        - id: keycloak
-          displayName: Keycloak
-          issuer: https://accounts.example.com/realms/provider
-          clientId: dashboard
-          scopes: ["openid", "profile", "roles"]
-          rolesClaimPath: "client_roles"
-          roleMapping:
-            admin: "admin"
-          silentRenew: true
-
-# Extra raw manifests:
-#   1. ca-cert Secret           → LE CA chain bundled into Keycloak's PKCS12.
-#   2. verifier RSA Certificate → RSA signing key for the verifier (APISIX needs RSA).
-#   3. nginx Ingress → APISIX gateway (workaround for the chart's Ingress limitations).
-extraManifests:
-  # LE CA chain bundled into the PKCS12 keystore by the Keycloak `get-did` init.
-  - apiVersion: v1
-    kind: Secret
-    metadata:
-      name: ca-cert
-      namespace: provider
-    type: Opaque
-    data:
-      ca.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVWekNDQWorZ0F3SUJBZ0lSQUtwMThlWXJqd29pQ1diVGk3L1V1cUV3RFFZSktvWklodmNOQVFFTEJRQXcKVHpFTE1Ba0dBMVVFQmhNQ1ZWTXhLVEFuQmdOVkJBb1RJRWx1ZEdWeWJtVjBJRk5sWTNWeWFYUjVJRkpsYzJWaApjbU5vSUVkeWIzVndNUlV3RXdZRFZRUURFd3hKVTFKSElGSnZiM1FnV0RFd0hoY05NalF3TXpFek1EQXdNREF3CldoY05NamN3TXpFeU1qTTFPVFU1V2pBeU1Rc3dDUVlEVlFRR0V3SlZVekVXTUJRR0ExVUVDaE1OVEdWMEozTWcKUlc1amNubHdkREVMTUFrR0ExVUVBeE1DUlRjd2RqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVJCNkFTVApDRmgvdmpjd0RNQ2dRZXIrVnRxRWt6N0pBTnVyWnhMUCtVOVRDZWlvTDZzcDVaOFZSdlJiWWs0UDFJTkJtYmVmClFISkZIQ3hjU2pLbXd0dkdCV3BsLzlyYThIVzBRRHNVYUpXMnFPSnFjZUowWlZGVDNoYlVIaWZCTS8yamdmZ3cKZ2ZVd0RnWURWUjBQQVFIL0JBUURBZ0dHTUIwR0ExVWRKUVFXTUJRR0NDc0dBUVVGQndNQ0JnZ3JCZ0VGQlFjRApBVEFTQmdOVkhSTUJBZjhFQ0RBR0FRSC9BZ0VBTUIwR0ExVWREZ1FXQkJTdVNKN2NoeDFFb0cvYW91VmdkQVI0Cndwd0FnREFmQmdOVkhTTUVHREFXZ0JSNXRGbm1lN2JsNUFGemdBaUl5QnBZOXVtYmJqQXlCZ2dyQmdFRkJRY0IKQVFRbU1DUXdJZ1lJS3dZQkJRVUhNQUtHRm1oMGRIQTZMeTk0TVM1cExteGxibU55TG05eVp5OHdFd1lEVlIwZwpCQXd3Q2pBSUJnWm5nUXdCQWdFd0p3WURWUjBmQkNBd0hqQWNvQnFnR0lZV2FIUjBjRG92TDNneExtTXViR1Z1ClkzSXViM0puTHpBTkJna3Foa2lHOXcwQkFRc0ZBQU9DQWdFQWp4NjZmRGRMazV5d0ZuM0N6QTF3MXFmeWxIVUQKYUVmMFFacFhjSnNlZGRKR1NmYlVVT3ZiTlI5Ti9RUTE2SzFsWGw0VkZ5aG1HWERUNUtkZmNyMFJ2SUlWck54RgpoNGxxSHRSUkNQNlJCUnN0cWJaMnpVUmdxYWtuL1hpcDBpYVFMMElkZkhCWnIzOTZGZ2tubmlSWUZja0tPUlBHCnlNM1FLbmQ2Nmd0TXN0OEk1bmtSUWxBZy9KYitHYzNlZ0l2dUdLV2JvRTFHODlOVHNOOUxUREQzUExqMGRVTXIKT0l1cVZqTEI4cEVDNnlrOWVucmxycWpYUWdrTEVZaFh6cTdkTGFmdjVWa2lnNkdsMG51dXFqcWZwMFExYmkxbwp5Vk5BbFhlNmFVWHc5MkNjZ2hDOWJOc0tFTzErTTUyWVk1K29mSVhsUy9TRVFidlZZWUJMWjV5ZWlnbFY2dDNTCk02SCt2VEcwYVA5WUh6TG4vS1ZPSHpHUWZYRFA3cU01dGtmKzdkaVplN28yZnc2TzdJdk42ZnNRWEVRUWo4VEoKVVhKeHYyL3VKaGN1eS90U0RnWHdITThVazM0V05iUlQ3ekdUR2tRUlgwZ3NiakFlYS9qWUFvV3YwWnZRUndwcQpQZTc5RC9pN0NlcDhxV25BKzdBRS8zQjNTLzNkRUVZbWMwbHBlMTM2NkEvNkdFZ2sza3RyOVBFb1FyTENoczZJCnR1M3duTkxCMmV1QzhJS0dMUUZwR3RPTy8yL2hpQUtqeWFqYUJQMjV3MWpGMFdsOEJicW5lM3VaMnExR3lQRkoKWVJtVDcvT1hwbU9IL0ZWTHR3Uys4bmcxY0FtcEN1alB3dGVKWk5jREcwc0Yybi9zYzArU1FmNDlmZHlVSzB0eQorVlV3Rmo5dG1XeHlSL009Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KCi0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpNSUlGYXpDQ0ExT2dBd0lCQWdJUkFJSVF6N0RTUU9OWlJHUGd1Mk9DaXdBd0RRWUpLb1pJaHZjTkFRRUxCUUF3ClR6RUxNQWtHQTFVRUJoTUNWVk14S1RBbkJnTlZCQW9USUVsdWRHVnlibVYwSUZObFkzVnlhWFI1SUZKbGMyVmgKY21Ob0lFZHliM1Z3TVJVd0V3WURWUVFERXd4SlUxSkhJRkp2YjNRZ1dERXdIaGNOTVRVd05qQTBNVEV3TkRNNApXaGNOTXpVd05qQTBNVEV3TkRNNFdqQlBNUXN3Q1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1ClpYUWdVMlZqZFhKcGRIa2dVbVZ6WldGeVkyZ2dSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQlkKTVRDQ0FpSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnSVBBRENDQWdvQ2dnSUJBSzNvSkhQMEZEZnptNTRyVnlnYwpoNzdjdDk4NGtJeHVQT1pYb0hqM2RjS2kvdlZxYnZZQVR5amIzbWlHYkVTVHRyRmovUlFTYTc4ZjB1b3hteUYrCjBUTTh1a2oxM1huZnM3ai9FdkVobWt2QmlvWnhhVXBtWm15UGZqeHd2NjBwSWdiejVNRG1nSzdpUzQrM21YNlUKQTUvVFI1ZDhtVWdqVStnNHJrOEtiNE11MFVsWGpJQjB0dG92MERpTmV3TndJUnQxOGpBOCtvK3UzZHBqcStzVwpUOEtPRVV0K3p3dm8vN1YzTHZTeWUwcmdUQklsREhDTkF5bWc0Vk1rN0JQWjdobS9FTE5LakQrSm8yRlIzcXlICkI1VDBZM0hzTHVKdlc1aUI0WWxjTkhsc2R1ODdrR0o1NXR1a21pOG14ZEFRNFE3ZTJSQ09GdnUzOTZqM3grVUMKQjVpUE5naVY1K0kzbGcwMmRaNzdEbkt4SFp1OEEvbEpCZGlCM1FXMEt0WkI2YXdCZHBVS0Q5amYxYjBTSHpVdgpLQmRzMHBqQnFBbGtkMjVITjdyT3JGbGVhSjEvY3RhSnhRWkJLVDVaUHQwbTlTVEpFYWRhbzB4QUgwYWhtYlduCk9sRnVoanVlZlhLbkVnVjRXZTArVVhnVkN3T1BqZEF2QmJJK2Uwb2NTM01GRXZ6RzZ1QlFFM3hEazNTenluVG4Kamg4QkNOQXcxRnR4TnJRSHVzRXdNRnhJdDRJN21LWjlZSXFpb3ltQ3pMcTlnd1Fib29NRFFhSFdCZkVid3JidwpxSHlHTzBhb1NDcUkzSGFhZHI4ZmFxVTlHWS9yT1BOazNzZ3JEUW9vLy9mYjRoVkMxQ0xRSjEzaGVmNFk1M0NJCnJVN20yWXM2eHQwblVXNy92R1QxTTBOUEFnTUJBQUdqUWpCQU1BNEdBMVVkRHdFQi93UUVBd0lCQmpBUEJnTlYKSFJNQkFmOEVCVEFEQVFIL01CMEdBMVVkRGdRV0JCUjV0Rm5tZTdibDVBRnpnQWlJeUJwWTl1bWJiakFOQmdrcQpoa2lHOXcwQkFRc0ZBQU9DQWdFQVZSOVlxYnl5cUZEUURMSFlHbWtnSnlrSXJHRjFYSXB1K0lMbGFTL1Y5bFpMCnViaHpFRm5USVpkKzUweHgrN0xTWUswNXFBdnFGeUZXaGZGUURsbnJ6dUJaNmJySkZlK0duWStFZ1BiazZaR1EKM0JlYllodEY4R2FWMG54dnd1bzc3eC9QeTlhdUovR3BzTWl1L1gxK212b2lCT3YvMlgvcWtTc2lzUmNPai9LSwpORnRZMlB3QnlWUzV1Q2JNaW9nemlVd3RoRHlDMys2V1Z3VzZMTHYzeExmSFRqdUN2akhJSW5Oemt0SENnS1E1Ck9SQXpJNEpNUEorR3NsV1lIYjRwaG93aW01N2lhenRYT29Kd1Rkd0p4NG5MQ2dkTmJPaGRqc252enF2SHU3VXIKVGtYV1N0QW16T1Z5eWdocXBaWGpGYUgzcE8zSkxGK2wrLytzS0FJdXZ0ZDd1K054ZTVBVzB3ZGVSbE44TndkQwpqTlBFbHB6Vm1iVXE0SlVhZ0VpdVREa0h6c3hIcEZLVks3cTQrNjNTTTFOOTVSMU5iZFdoc2NkQ2IrWkFKelZjCm95aTNCNDNualRPUTV5T2YrMUNjZVd4RzFiUVZzNVp1ZnBzTWxqcTRVaTAvMWx2aCt3akNoUDRrcUtPSjJxeHEKNFJncXNhaERZVnZUSDl3N2pYYnlMZWlOZGQ4WE0ydzlVL3Q3eTBGZi85eWkwR0U0NFphNHJGMkxOOWQxMVRQQQptUkd1blVIQmNuV0V2Z0pCUWw5bkpFaVUwWnNudmdjL3ViaFBnWFJSNFhxMzdaMGo0cjdnMVNnRUV6d3hBNTdkCmVteVB4Z2NZeG4vZVI0NC9LSjRFQnMrbFZEUjN2ZXlKbStrWFE5OWIyMS8ramg1WG9zMUFuWDVpSXRyZUdDYz0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQoKLS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNHekNDQWFHZ0F3SUJBZ0lRUWRLZDBYTHE3cWVBd1N4czZTK0hVakFLQmdncWhrak9QUVFEQXpCUE1Rc3cKQ1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1WlhRZ1UyVmpkWEpwZEhrZ1VtVnpaV0Z5WTJnZwpSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQllNakFlRncweU1EQTVNRFF3TURBd01EQmFGdzAwCk1EQTVNVGN4TmpBd01EQmFNRTh4Q3pBSkJnTlZCQVlUQWxWVE1Ta3dKd1lEVlFRS0V5QkpiblJsY201bGRDQlQKWldOMWNtbDBlU0JTWlhObFlYSmphQ0JIY205MWNERVZNQk1HQTFVRUF4TU1TVk5TUnlCU2IyOTBJRmd5TUhZdwpFQVlIS29aSXpqMENBUVlGSzRFRUFDSURZZ0FFelp2Vm40Q0RDdXdKU3ZNV1NqNWN6M2VzM21jRkRSMEh0dHdXCisxcUxGTnZpY1dERXVrV1ZFWW1PNmdiZjl5b1dIS1M1eGNVeTRBUGdIb0lZT0l2WFJkZ0thbTdtQUhmN0FsRjkKSXRnS2JwcGJkOS93K2tIc09keDF5bWdIREIvcW8wSXdRREFPQmdOVkhROEJBZjhFQkFNQ0FRWXdEd1lEVlIwVApBUUgvQkFVd0F3RUIvekFkQmdOVkhRNEVGZ1FVZkVLV3J0NUxTRHY2a3ZpZWpNOXRpNmx5TjVVd0NnWUlLb1pJCnpqMEVBd01EYUFBd1pRSXdlM2xPUmxDRXdrU0hSaHRGY1A5WW1kNzAvYVRTVmFZZ0xYVFdOTHhCbzFCZkFTZFcKdEw0bmRRYXZFaTUxbUkzOEFqRUFpL1YzYk5USVphcmdDeXp1Rkowbk42VDVVNlZSNUNtRDEvaVFNVnRDbndyMQovcTRBYU9lTVNRKzJiMXRiRmZMbgotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0t
-
-  # RSA cert for the verifier's JWT signing (mounted as volume `signing-certs-vol`).
-  - apiVersion: cert-manager.io/v1
-    kind: Certificate
-    metadata:
-      name: verifier-internal-rsa-cert
-      namespace: provider
-    spec:
-      commonName: verifier.example.com
-      dnsNames:
-        - verifier.example.com
-      issuerRef:
-        group: cert-manager.io
-        kind: ClusterIssuer
-        name: prod
-      privateKey:
-        algorithm: RSA
-      secretName: verifier-rsa-cert
-      usages:
-        - key encipherment
-
-  # Backend Service name is <helm-release>-apisix-gateway. Update if release != `provider`.
-  - apiVersion: networking.k8s.io/v1
-    kind: Ingress
-    metadata:
-      name: provider-apisix
-      namespace: provider
-      annotations:
-        kubernetes.io/ingress.class: nginx
-        cert-manager.io/cluster-issuer: prod
-        cert-manager.io/private-key-algorithm: ECDSA
-    spec:
-      ingressClassName: nginx
-      rules:
-        - host: mp-data-service.example.com
-          http:
-            paths:
-              - path: /
-                pathType: Prefix
-                backend:
-                  service:
-                    name: provider-apisix-gateway
-                    port:
-                      number: 80
-      tls:
-        - secretName: mp-data-service.example.com-tls
-          hosts:
-            - mp-data-service.example.com
 
 # Marketplace (BAE) — web storefront + order pipeline on top of TMForum APIs.
 # Subcharts:
@@ -1050,6 +633,368 @@ marketplace:
       - name: BAE_LP_SIOP_PRIVATE_KEY_PEM
         value: /certs-did/tls.key
 
+# Listens for TMForum order events, generates the ODRL policy from the offering
+# template, posts it to ODRL-PAP, and notifies the buyer with an access credential.
+contract-management:
+  enabled: true
+  enableRainbow: false
+  fullnameOverride: contract-management
+  did: did:web:did-provider.example.com:did
+  organization:
+    provider:
+      role: seller
+  services:
+    product-order:    { url: http://tm-forum-api-svc:8080 }
+    party:            { url: http://tm-forum-api-svc:8080 }
+    product-catalog:  { url: http://tm-forum-api-svc:8080 }
+    service-catalog:  { url: http://tm-forum-api-svc:8080 }
+    quote:            { url: http://tm-forum-api-svc:8080 }
+    odrl:             { url: http://odrl-pap:8080 }
+    trusted-issuers-list: { url: http://trusted-issuers-list:8080 }
+  til:
+    credentialType: OperatorCredential
+  notification:
+    enabled: true
+    host: contract-management
+
+# Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI).
+# The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
+# Bitnami moved the image to `bitnamilegacy/keycloak`; override repo + allowInsecureImages,
+# otherwise ImagePullBackOff.
+keycloak:
+  enabled: true
+  kubeVersion: 1.34-1
+  metrics: { enabled: true }
+  global:
+    security:
+      allowInsecureImages: true
+  image:
+    repository: bitnamilegacy/keycloak
+  containerSecurityContext: { enabled: false }
+  ingress:
+    pathType: Prefix
+    annotations:
+      cert-manager.io/common-name: accounts.example.com
+      cert-manager.io/cluster-issuer: prod
+      kubernetes.io/ingress.class: nginx
+    enabled: true
+    hostname: accounts.example.com
+    ingressClassName: nginx
+    tls: true
+  proxyHeaders: xforwarded
+  proxy: edge
+  tls: { enabled: false }
+  service:
+    ports: { http: 8080 }
+    extraPorts:
+      - { name: management, port: 9000, targetPort: 9000 }
+  auth:
+    existingSecret: issuance-secret
+    passwordSecretKey: keycloak-admin
+    adminUser: keycloak-admin
+  resources:
+    requests: { memory: "500Mi", cpu: "0.5" }
+    limits:   { memory: "2Gi",   cpu: "1" }
+  livenessProbe:  { failureThreshold: 20 }
+  readinessProbe: { failureThreshold: 20 }
+  postgresql: { enabled: false }
+  externalDatabase:
+    host: postgres
+    database: keycloakdb
+    user: keycloak
+    existingSecret: keycloak.postgres.credentials.postgresql.acid.zalan.do
+    existingSecretPasswordKey: password
+  extraVolumeMounts:
+    - { name: did-material, mountPath: /did-material }
+    - { name: realms,       mountPath: /opt/bitnami/keycloak/data/import }
+  extraVolumes:
+    - name: did-material
+      emptyDir: {}
+    - name: realms
+      # ConfigMap rendered by the chart from `keycloak.realm` below.
+      configMap: { name: provider-realm }
+    - name: did-priv-key
+      secret: { secretName: did-provider.example.com-tls }
+    - name: ca-cert
+      secret: { secretName: ca-cert }
+  # Builds a PKCS12 keystore from the cert-manager PEM keypair (Keycloak signs VCs
+  # from PKCS12, not PEM). Alias `didPrivateKey` matches `signingKey.keyAlias`.
+  initContainers:
+    - name: get-did
+      image: alpine/openssl:latest
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          openssl pkcs12 -export \
+            -in /certs-did/tls.crt \
+            -inkey /certs-did/tls.key \
+            -out /did-material/cert.pfx \
+            -certfile /ca-certs/ca.crt \
+            -name "didPrivateKey" \
+            -passout env:STORE_PASS
+          chmod 644 /did-material/cert.pfx
+      env:
+        - name: STORE_PASS
+          valueFrom:
+            secretKeyRef: { name: issuance-secret, key: store-pass }
+      volumeMounts:
+        - { name: did-material, mountPath: /did-material }
+        - { name: did-priv-key, mountPath: /certs-did }
+        - { name: ca-cert,      mountPath: /ca-certs }
+  # KC_FEATURES=oid4vc-vci   → enables the OID4VCI issuer (preview feature).
+  # --import-realm           → loads the realm JSON from `keycloak.realm` on startup.
+  # DID                      → substituted into ${DID} at realm import time.
+  extraEnvVars:
+    - name: KEYCLOAK_EXTRA_ARGS
+      value: "--import-realm --health-enabled true"
+    - name: KC_FEATURES
+      value: "oid4vc-vci"
+    - name: KC_HEAP_SIZE
+      value: "1024m"
+    - name: DID
+      value: did:web:did-provider.example.com:did
+    - name: STORE_PASS
+      valueFrom:
+        secretKeyRef: { name: issuance-secret, key: store-pass }
+
+  # Realm structured import.
+  realm:
+    import: true
+    name: provider
+    frontendUrl: https://accounts.example.com
+    attributes:
+      sslRequired: "none"
+
+    # Convention: ONE client per *target participant*, `clientId == that peer's DID`.
+    # Roles assigned on that client → emitted in the VC with `target` = that DID
+    # (via oid4vc-target-role-mapper). Here we only declare the self-client (${DID}).
+    clients:
+      - clientId: ${DID}
+        enabled: true
+        description: Client to manage itself
+        surrogateAuthRequired: false
+        alwaysDisplayInConsole: false
+        clientAuthenticatorType: client-secret
+        defaultRoles: []
+        redirectUris: []
+        webOrigins: []
+        notBefore: 0
+        bearerOnly: false
+        consentRequired: false
+        standardFlowEnabled: true
+        implicitFlowEnabled: false
+        directAccessGrantsEnabled: false
+        serviceAccountsEnabled: false
+        publicClient: false
+        frontchannelLogout: false
+        protocol: oid4vc
+        protocolMappers: []
+        authenticationFlowBindingOverrides: {}
+        fullScopeAllowed: true
+        nodeReRegistrationTimeout: -1
+        defaultClientScopes: []
+        optionalClientScopes: []
+
+    # Client roles per Keycloak client. `${DID}` is the self-client.
+    clientRoles:
+      ${DID}:
+        - { name: customer,       description: "Is allowed to see offers etc.",  clientRole: true }
+        - { name: OPERATOR,       description: "Is allowed to operate clusters.", clientRole: true }
+        - { name: REPRESENTATIVE, description: "Is allowed to register.",         clientRole: true }
+        - { name: seller,         description: "Seller role",                     clientRole: true }
+        - { name: admin,          description: "Admin role",                      clientRole: true }
+
+    # Do NOT redeclare /admin and /consumer groups: chart's `defaultGroups` already
+    # adds them and a redeclaration breaks --import-realm with a UNIQUE constraint.
+
+    users:
+      - username: employee
+        enabled: true
+        email: employee@provider.org
+        firstName: Test
+        lastName: User
+        credentials:
+          - { type: password, value: "test" }
+        clientRoles:
+          ${DID}: [seller, admin]
+          account: [view-profile, manage-account]
+          dashboard: [admin]
+        groups:
+          - /consumer
+
+    # VC types this realm issues (OID4VCI). Each entry → client scope + issuer metadata.
+    # `credential_signing_alg_values_supported` MUST match `signingKey.keyAlgorithm`
+    # and the algorithm of the key inside the PKCS12 keystore.
+    # Mappers populate `credentialSubject`:
+    #   oid4vc-context-mapper        → JSON-LD @context entries
+    #   oid4vc-user-attribute-mapper → copy Keycloak user attribute → VC claim
+    #   oid4vc-target-role-mapper    → roles on client `config.clientId`, scoped to that target DID
+    verifiableCredentials:
+      user-sd:
+        attributes:
+          credential_signing_alg_values_supported: ES256
+          credential_build_config.signing_algorithm: ES256
+          credential_build_config.token_jws_type: vc+sd-jwt
+          credential_build_config.proof_types_supported:
+            jwt:
+              proof_signing_alg_values_supported:
+                - ES256
+          format: vc+sd-jwt
+          scope: LegalPersonCredential
+          vct: LegalPersonCredential
+          credential_build_config.visible_claims: roles,email
+          credential_build_config.decoys: 3
+        clientScope:
+          create: true
+        protocolMappers:
+          - name: context-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-context-mapper
+            config:
+              context: https://www.w3.org/2018/credentials/v1
+              supportedCredentialTypes: LegalPersonCredential
+          - name: email-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: email
+              userAttribute: email
+              supportedCredentialTypes: LegalPersonCredential
+          - name: firstName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: firstName
+              userAttribute: firstName
+              supportedCredentialTypes: LegalPersonCredential
+          - name: lastName-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-user-attribute-mapper
+            config:
+              subjectProperty: lastName
+              userAttribute: lastName
+              supportedCredentialTypes: LegalPersonCredential
+          - name: role-mapper
+            protocol: oid4vc
+            protocolMapper: oid4vc-target-role-mapper
+            config:
+              subjectProperty: roles
+              clientId: ${DID}
+              supportedCredentialTypes: LegalPersonCredential
+
+  # `keyAlgorithm` must match the PKCS12 key and `credential_signing_alg_values_supported`.
+  signingKey:
+    storePath: /did-material/cert.pfx
+    storePassword: "${STORE_PASS}"
+    keyAlias: didPrivateKey
+    keyPassword: "${STORE_PASS}"
+    keyAlgorithm: ES256
+    did: did:web:did-provider.example.com:did
+
+# Operator UI for TIL/CCS/ODRL-PAP/APISIX. Gated by the `dashboard` Keycloak client.
+fdsc-dashboard:
+  enabled: true
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: prod
+      cert-manager.io/private-key-algorithm: ECDSA
+
+    hosts:
+      - host: dashboard-provider.example.com
+        paths:
+          - "/"
+    tls:
+      - secretName: dashboard-provider.example.com-tls
+        hosts:
+          - dashboard-provider.example.com
+  apisix:
+    enabled: true
+    # Service name is <helm-release>-apisix-admin. Update if release != `provider`.
+    dashboardUrl: http://provider-apisix-admin:9180/ui
+    adminKey: admin
+  apiUrls:
+    til: http://trusted-issuers-list:8080
+    ccs: http://credentials-config-service:8080
+    odrl: http://odrl-pap:8080
+  auth:
+    config:
+      providers:
+        - id: keycloak
+          displayName: Keycloak
+          issuer: https://accounts.example.com/realms/provider
+          clientId: dashboard
+          scopes: ["openid", "profile", "roles"]
+          rolesClaimPath: "client_roles"
+          roleMapping:
+            admin: "admin"
+          silentRenew: true
+
+# Extra raw manifests:
+#   1. ca-cert Secret           → LE CA chain bundled into Keycloak's PKCS12.
+#   2. verifier RSA Certificate → RSA signing key for the verifier (APISIX needs RSA).
+#   3. nginx Ingress → APISIX gateway (workaround for the chart's Ingress limitations).
+extraManifests:
+  # LE CA chain bundled into the PKCS12 keystore by the Keycloak `get-did` init.
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: ca-cert
+      namespace: provider
+    type: Opaque
+    data:
+      ca.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVWekNDQWorZ0F3SUJBZ0lSQUtwMThlWXJqd29pQ1diVGk3L1V1cUV3RFFZSktvWklodmNOQVFFTEJRQXcKVHpFTE1Ba0dBMVVFQmhNQ1ZWTXhLVEFuQmdOVkJBb1RJRWx1ZEdWeWJtVjBJRk5sWTNWeWFYUjVJRkpsYzJWaApjbU5vSUVkeWIzVndNUlV3RXdZRFZRUURFd3hKVTFKSElGSnZiM1FnV0RFd0hoY05NalF3TXpFek1EQXdNREF3CldoY05NamN3TXpFeU1qTTFPVFU1V2pBeU1Rc3dDUVlEVlFRR0V3SlZVekVXTUJRR0ExVUVDaE1OVEdWMEozTWcKUlc1amNubHdkREVMTUFrR0ExVUVBeE1DUlRjd2RqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVJCNkFTVApDRmgvdmpjd0RNQ2dRZXIrVnRxRWt6N0pBTnVyWnhMUCtVOVRDZWlvTDZzcDVaOFZSdlJiWWs0UDFJTkJtYmVmClFISkZIQ3hjU2pLbXd0dkdCV3BsLzlyYThIVzBRRHNVYUpXMnFPSnFjZUowWlZGVDNoYlVIaWZCTS8yamdmZ3cKZ2ZVd0RnWURWUjBQQVFIL0JBUURBZ0dHTUIwR0ExVWRKUVFXTUJRR0NDc0dBUVVGQndNQ0JnZ3JCZ0VGQlFjRApBVEFTQmdOVkhSTUJBZjhFQ0RBR0FRSC9BZ0VBTUIwR0ExVWREZ1FXQkJTdVNKN2NoeDFFb0cvYW91VmdkQVI0Cndwd0FnREFmQmdOVkhTTUVHREFXZ0JSNXRGbm1lN2JsNUFGemdBaUl5QnBZOXVtYmJqQXlCZ2dyQmdFRkJRY0IKQVFRbU1DUXdJZ1lJS3dZQkJRVUhNQUtHRm1oMGRIQTZMeTk0TVM1cExteGxibU55TG05eVp5OHdFd1lEVlIwZwpCQXd3Q2pBSUJnWm5nUXdCQWdFd0p3WURWUjBmQkNBd0hqQWNvQnFnR0lZV2FIUjBjRG92TDNneExtTXViR1Z1ClkzSXViM0puTHpBTkJna3Foa2lHOXcwQkFRc0ZBQU9DQWdFQWp4NjZmRGRMazV5d0ZuM0N6QTF3MXFmeWxIVUQKYUVmMFFacFhjSnNlZGRKR1NmYlVVT3ZiTlI5Ti9RUTE2SzFsWGw0VkZ5aG1HWERUNUtkZmNyMFJ2SUlWck54RgpoNGxxSHRSUkNQNlJCUnN0cWJaMnpVUmdxYWtuL1hpcDBpYVFMMElkZkhCWnIzOTZGZ2tubmlSWUZja0tPUlBHCnlNM1FLbmQ2Nmd0TXN0OEk1bmtSUWxBZy9KYitHYzNlZ0l2dUdLV2JvRTFHODlOVHNOOUxUREQzUExqMGRVTXIKT0l1cVZqTEI4cEVDNnlrOWVucmxycWpYUWdrTEVZaFh6cTdkTGFmdjVWa2lnNkdsMG51dXFqcWZwMFExYmkxbwp5Vk5BbFhlNmFVWHc5MkNjZ2hDOWJOc0tFTzErTTUyWVk1K29mSVhsUy9TRVFidlZZWUJMWjV5ZWlnbFY2dDNTCk02SCt2VEcwYVA5WUh6TG4vS1ZPSHpHUWZYRFA3cU01dGtmKzdkaVplN28yZnc2TzdJdk42ZnNRWEVRUWo4VEoKVVhKeHYyL3VKaGN1eS90U0RnWHdITThVazM0V05iUlQ3ekdUR2tRUlgwZ3NiakFlYS9qWUFvV3YwWnZRUndwcQpQZTc5RC9pN0NlcDhxV25BKzdBRS8zQjNTLzNkRUVZbWMwbHBlMTM2NkEvNkdFZ2sza3RyOVBFb1FyTENoczZJCnR1M3duTkxCMmV1QzhJS0dMUUZwR3RPTy8yL2hpQUtqeWFqYUJQMjV3MWpGMFdsOEJicW5lM3VaMnExR3lQRkoKWVJtVDcvT1hwbU9IL0ZWTHR3Uys4bmcxY0FtcEN1alB3dGVKWk5jREcwc0Yybi9zYzArU1FmNDlmZHlVSzB0eQorVlV3Rmo5dG1XeHlSL009Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KCi0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpNSUlGYXpDQ0ExT2dBd0lCQWdJUkFJSVF6N0RTUU9OWlJHUGd1Mk9DaXdBd0RRWUpLb1pJaHZjTkFRRUxCUUF3ClR6RUxNQWtHQTFVRUJoTUNWVk14S1RBbkJnTlZCQW9USUVsdWRHVnlibVYwSUZObFkzVnlhWFI1SUZKbGMyVmgKY21Ob0lFZHliM1Z3TVJVd0V3WURWUVFERXd4SlUxSkhJRkp2YjNRZ1dERXdIaGNOTVRVd05qQTBNVEV3TkRNNApXaGNOTXpVd05qQTBNVEV3TkRNNFdqQlBNUXN3Q1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1ClpYUWdVMlZqZFhKcGRIa2dVbVZ6WldGeVkyZ2dSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQlkKTVRDQ0FpSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnSVBBRENDQWdvQ2dnSUJBSzNvSkhQMEZEZnptNTRyVnlnYwpoNzdjdDk4NGtJeHVQT1pYb0hqM2RjS2kvdlZxYnZZQVR5amIzbWlHYkVTVHRyRmovUlFTYTc4ZjB1b3hteUYrCjBUTTh1a2oxM1huZnM3ai9FdkVobWt2QmlvWnhhVXBtWm15UGZqeHd2NjBwSWdiejVNRG1nSzdpUzQrM21YNlUKQTUvVFI1ZDhtVWdqVStnNHJrOEtiNE11MFVsWGpJQjB0dG92MERpTmV3TndJUnQxOGpBOCtvK3UzZHBqcStzVwpUOEtPRVV0K3p3dm8vN1YzTHZTeWUwcmdUQklsREhDTkF5bWc0Vk1rN0JQWjdobS9FTE5LakQrSm8yRlIzcXlICkI1VDBZM0hzTHVKdlc1aUI0WWxjTkhsc2R1ODdrR0o1NXR1a21pOG14ZEFRNFE3ZTJSQ09GdnUzOTZqM3grVUMKQjVpUE5naVY1K0kzbGcwMmRaNzdEbkt4SFp1OEEvbEpCZGlCM1FXMEt0WkI2YXdCZHBVS0Q5amYxYjBTSHpVdgpLQmRzMHBqQnFBbGtkMjVITjdyT3JGbGVhSjEvY3RhSnhRWkJLVDVaUHQwbTlTVEpFYWRhbzB4QUgwYWhtYlduCk9sRnVoanVlZlhLbkVnVjRXZTArVVhnVkN3T1BqZEF2QmJJK2Uwb2NTM01GRXZ6RzZ1QlFFM3hEazNTenluVG4Kamg4QkNOQXcxRnR4TnJRSHVzRXdNRnhJdDRJN21LWjlZSXFpb3ltQ3pMcTlnd1Fib29NRFFhSFdCZkVid3JidwpxSHlHTzBhb1NDcUkzSGFhZHI4ZmFxVTlHWS9yT1BOazNzZ3JEUW9vLy9mYjRoVkMxQ0xRSjEzaGVmNFk1M0NJCnJVN20yWXM2eHQwblVXNy92R1QxTTBOUEFnTUJBQUdqUWpCQU1BNEdBMVVkRHdFQi93UUVBd0lCQmpBUEJnTlYKSFJNQkFmOEVCVEFEQVFIL01CMEdBMVVkRGdRV0JCUjV0Rm5tZTdibDVBRnpnQWlJeUJwWTl1bWJiakFOQmdrcQpoa2lHOXcwQkFRc0ZBQU9DQWdFQVZSOVlxYnl5cUZEUURMSFlHbWtnSnlrSXJHRjFYSXB1K0lMbGFTL1Y5bFpMCnViaHpFRm5USVpkKzUweHgrN0xTWUswNXFBdnFGeUZXaGZGUURsbnJ6dUJaNmJySkZlK0duWStFZ1BiazZaR1EKM0JlYllodEY4R2FWMG54dnd1bzc3eC9QeTlhdUovR3BzTWl1L1gxK212b2lCT3YvMlgvcWtTc2lzUmNPai9LSwpORnRZMlB3QnlWUzV1Q2JNaW9nemlVd3RoRHlDMys2V1Z3VzZMTHYzeExmSFRqdUN2akhJSW5Oemt0SENnS1E1Ck9SQXpJNEpNUEorR3NsV1lIYjRwaG93aW01N2lhenRYT29Kd1Rkd0p4NG5MQ2dkTmJPaGRqc252enF2SHU3VXIKVGtYV1N0QW16T1Z5eWdocXBaWGpGYUgzcE8zSkxGK2wrLytzS0FJdXZ0ZDd1K054ZTVBVzB3ZGVSbE44TndkQwpqTlBFbHB6Vm1iVXE0SlVhZ0VpdVREa0h6c3hIcEZLVks3cTQrNjNTTTFOOTVSMU5iZFdoc2NkQ2IrWkFKelZjCm95aTNCNDNualRPUTV5T2YrMUNjZVd4RzFiUVZzNVp1ZnBzTWxqcTRVaTAvMWx2aCt3akNoUDRrcUtPSjJxeHEKNFJncXNhaERZVnZUSDl3N2pYYnlMZWlOZGQ4WE0ydzlVL3Q3eTBGZi85eWkwR0U0NFphNHJGMkxOOWQxMVRQQQptUkd1blVIQmNuV0V2Z0pCUWw5bkpFaVUwWnNudmdjL3ViaFBnWFJSNFhxMzdaMGo0cjdnMVNnRUV6d3hBNTdkCmVteVB4Z2NZeG4vZVI0NC9LSjRFQnMrbFZEUjN2ZXlKbStrWFE5OWIyMS8ramg1WG9zMUFuWDVpSXRyZUdDYz0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQoKLS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNHekNDQWFHZ0F3SUJBZ0lRUWRLZDBYTHE3cWVBd1N4czZTK0hVakFLQmdncWhrak9QUVFEQXpCUE1Rc3cKQ1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1WlhRZ1UyVmpkWEpwZEhrZ1VtVnpaV0Z5WTJnZwpSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQllNakFlRncweU1EQTVNRFF3TURBd01EQmFGdzAwCk1EQTVNVGN4TmpBd01EQmFNRTh4Q3pBSkJnTlZCQVlUQWxWVE1Ta3dKd1lEVlFRS0V5QkpiblJsY201bGRDQlQKWldOMWNtbDBlU0JTWlhObFlYSmphQ0JIY205MWNERVZNQk1HQTFVRUF4TU1TVk5TUnlCU2IyOTBJRmd5TUhZdwpFQVlIS29aSXpqMENBUVlGSzRFRUFDSURZZ0FFelp2Vm40Q0RDdXdKU3ZNV1NqNWN6M2VzM21jRkRSMEh0dHdXCisxcUxGTnZpY1dERXVrV1ZFWW1PNmdiZjl5b1dIS1M1eGNVeTRBUGdIb0lZT0l2WFJkZ0thbTdtQUhmN0FsRjkKSXRnS2JwcGJkOS93K2tIc09keDF5bWdIREIvcW8wSXdRREFPQmdOVkhROEJBZjhFQkFNQ0FRWXdEd1lEVlIwVApBUUgvQkFVd0F3RUIvekFkQmdOVkhRNEVGZ1FVZkVLV3J0NUxTRHY2a3ZpZWpNOXRpNmx5TjVVd0NnWUlLb1pJCnpqMEVBd01EYUFBd1pRSXdlM2xPUmxDRXdrU0hSaHRGY1A5WW1kNzAvYVRTVmFZZ0xYVFdOTHhCbzFCZkFTZFcKdEw0bmRRYXZFaTUxbUkzOEFqRUFpL1YzYk5USVphcmdDeXp1Rkowbk42VDVVNlZSNUNtRDEvaVFNVnRDbndyMQovcTRBYU9lTVNRKzJiMXRiRmZMbgotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0t
+
+  # RSA cert for the verifier's JWT signing (mounted as volume `signing-certs-vol`).
+  - apiVersion: cert-manager.io/v1
+    kind: Certificate
+    metadata:
+      name: verifier-internal-rsa-cert
+      namespace: provider
+    spec:
+      commonName: verifier.example.com
+      dnsNames:
+        - verifier.example.com
+      issuerRef:
+        group: cert-manager.io
+        kind: ClusterIssuer
+        name: prod
+      privateKey:
+        algorithm: RSA
+      secretName: verifier-rsa-cert
+      usages:
+        - key encipherment
+
+  # Backend Service name is <helm-release>-apisix-gateway. Update if release != `provider`.
+  - apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: provider-apisix
+      namespace: provider
+      annotations:
+        kubernetes.io/ingress.class: nginx
+        cert-manager.io/cluster-issuer: prod
+        cert-manager.io/private-key-algorithm: ECDSA
+    spec:
+      ingressClassName: nginx
+      rules:
+        - host: mp-data-service.example.com
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: provider-apisix-gateway
+                    port:
+                      number: 80
+      tls:
+        - secretName: mp-data-service.example.com-tls
+          hosts:
+            - mp-data-service.example.com
+
 # Disabled subcharts:
 #   vault            → using sealed-secrets instead
 #   fdsc-edc/identityhub → Eclipse Dataspace Components (we use OID4VP only)
@@ -1064,4 +1009,3 @@ rainbow:          { enabled: false }
 dataSpaceConfig:  { enabled: false }
 registration:     { enabled: false }
 credentials:      { enabled: false }
-

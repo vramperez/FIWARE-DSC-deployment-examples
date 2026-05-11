@@ -387,7 +387,7 @@ did:
     server:
       runServer: "true"
       certPath: /certs/tls.crt
-      hostUrl: "https://did-consumer.example.com/did"
+      hostUrl: "https://did-consumer.example.com/did" # did:web:did-consumer.example.com:did
       keystorePasswordSecretName: ""
       keystorePasswordSecretKey: ""
       keyAlias: "myAlias"
