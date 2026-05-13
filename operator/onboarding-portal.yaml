@@ -1,0 +1,282 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCLAIMER — Training / educational example only.
+# Do NOT deploy as-is in production. Review credentials, hostnames, cert
+# issuers, SMTP settings, persistence, and the Keycloak realm wiring first.
+# ─────────────────────────────────────────────────────────────────────────────
+# Onboarding portal — issues LegalPersonCredential / OperatorCredential VCs
+# to participants joining the dataspace. Runs in the `central-marketplace`
+# namespace alongside the trust anchor / TIR; the central Keycloak is its IdP.
+
+image:
+  pullPolicy: Always
+  tag: 0.1.0
+
+# `database`: Secret auto-created by the Zalando Postgres operator
+# (per-user `<user>.<cluster>.credentials.postgresql.acid.zalan.do`).
+# `login` + `keycloak`: provisioned externally via sealed-secrets.
+secrets:
+  database:
+    secretName: trust-anchor.onboarding.postgres.credentials.postgresql.acid.zalan.do
+    usernameKey: username
+    passwordKey: password
+  login:
+    secretName: onboarding-secrets
+    clientIdKey: login-client-id
+    clientSecretKey: login-client-secret
+  keycloak:
+    create: true
+    secretName: onboarding-secrets
+    usernameKey: keycloak-username
+    passwordKey: keycloak-password
+
+config:
+  # Reuses the central trust-anchor Postgres (schema isolation by db name).
+  # `synchronize: true` enables TypeORM auto-migration — dev convenience only,
+  # disable in prod and run migrations explicitly.
+  database:
+    type: postgres
+    port: 5432
+    synchronize: true
+    logging: false
+    host: postgres.central-marketplace.svc.cluster.local
+    database: onboarding
+    timezone: Z
+  app:
+    documentToSignUrl: https://pdfobject.com/pdf/sample.pdf # URL of the DS contract for new participants
+    login:
+      # Central (dataspace-wide) Keycloak — NOT the provider's own.
+      openIdUrl: https://accounts-central.example.com/realms/onboarding
+    tir:
+      url: http://tir.trust-anchor.svc.cluster.local:8080
+    keycloak:
+      didCreationEnabled: true
+      baseUrl: https://accounts-central.example.com
+      realmName: master
+      # additionalClientScopes is a LIST → Spring/Quarkus replaces the whole
+      # list when overriden, so we re-declare the upstream LegalPersonCredential
+      # entry alongside the new OperatorCredential one.
+      additionalClientScopes:
+        - name: LegalPersonCredential
+          description: OIDC4VC Scope, that adds all properties required for a user.
+          protocol: openid-connect
+          attributes:
+            include.in.token.scope: "false"
+            display.on.consent.screen: "false"
+          protocolMappers:
+            - name: context-mapper
+              protocol: oid4vc
+              protocolMapper: oid4vc-context-mapper
+              consentRequired: false
+              config:
+                context: https://www.w3.org/2018/credentials/v1
+                supportedCredentialTypes: LegalPersonCredential
+            - name: firstName-mapper
+              protocol: oid4vc
+              protocolMapper: oid4vc-user-attribute-mapper
+              consentRequired: false
+              config:
+                subjectProperty: firstName
+                supportedCredentialTypes: LegalPersonCredential
+                userAttribute: firstName
+            - name: email-mapper
+              protocol: oid4vc
+              protocolMapper: oid4vc-user-attribute-mapper
+              consentRequired: false
+              config:
+                subjectProperty: email
+                supportedCredentialTypes: LegalPersonCredential
+                userAttribute: email
+            - name: lastName-mapper
+              protocol: oid4vc
+              protocolMapper: oid4vc-user-attribute-mapper
+              consentRequired: false
+              config:
+                subjectProperty: lastName
+                supportedCredentialTypes: LegalPersonCredential
+                userAttribute: lastName
+            - name: role-mapper
+              protocol: oid4vc
+              protocolMapper: oid4vc-target-role-mapper
+              consentRequired: false
+              config:
+                subjectProperty: roles
+                supportedCredentialTypes: LegalPersonCredential
+                clientId: ${DID}
+
+        # Issued to users that operate clusters and consume the data-service.
+        # Mirrors LegalPersonCredential but with `supportedCredentialTypes: OperatorCredential`.
+        - name: OperatorCredential
+          description: OIDC4VC Scope for users that operate clusters / consume the data-service.
+          protocol: openid-connect
+          attributes:
+            include.in.token.scope: "false"
+            display.on.consent.screen: "false"
+          protocolMappers:
+            - name: context-mapper-operator
+              protocol: oid4vc
+              protocolMapper: oid4vc-context-mapper
+              consentRequired: false
+              config:
+                context: https://www.w3.org/2018/credentials/v1
+                supportedCredentialTypes: OperatorCredential
+            - name: firstName-mapper-operator
+              protocol: oid4vc
+              protocolMapper: oid4vc-user-attribute-mapper
+              consentRequired: false
+              config:
+                subjectProperty: firstName
+                supportedCredentialTypes: OperatorCredential
+                userAttribute: firstName
+            - name: email-mapper-operator
+              protocol: oid4vc
+              protocolMapper: oid4vc-user-attribute-mapper
+              consentRequired: false
+              config:
+                subjectProperty: email
+                supportedCredentialTypes: OperatorCredential
+                userAttribute: email
+            - name: lastName-mapper-operator
+              protocol: oid4vc
+              protocolMapper: oid4vc-user-attribute-mapper
+              consentRequired: false
+              config:
+                subjectProperty: lastName
+                supportedCredentialTypes: OperatorCredential
+                userAttribute: lastName
+            - name: role-mapper-operator
+              protocol: oid4vc
+              protocolMapper: oid4vc-target-role-mapper
+              consentRequired: false
+              config:
+                subjectProperty: roles
+                supportedCredentialTypes: OperatorCredential
+                clientId: ${DID}
+
+      # Realm bootstrap applied on first start of the central Keycloak.
+      # `${DID}` is expanded at runtime — convention: one client per target DID.
+      defaultRealmConfig:
+        clients:
+          - clientId: ${DID}
+            enabled: true
+            protocol: openid-connect
+            publicClient: false
+            serviceAccountsEnabled: true
+            clientAuthenticatorType: client-secret
+            redirectUris: []
+            directAccessGrantsEnabled: true
+            defaultClientScopes:
+              - web-origins
+              - acr
+              - roles
+              - profile
+              - basic
+              - email
+            optionalClientScopes: []
+            surrogateAuthRequired: false
+            alwaysDisplayInConsole: false
+            defaultRoles: []
+            webOrigins: []
+            notBefore: 0
+            bearerOnly: false
+            consentRequired: false
+            standardFlowEnabled: true
+            implicitFlowEnabled: false
+            frontchannelLogout: false
+            protocolMappers: []
+            authenticationFlowBindingOverrides: {}
+            fullScopeAllowed: true
+            nodeReRegistrationTimeout: -1
+
+        roles:
+          client:
+            ${DID}:
+              - name: customer
+                description: Customer role
+              - name: OPERATOR
+                description: Operator role — required to obtain an OperatorCredential
+                  and access the purchased data-service.
+        # OID4VCI issuer metadata for OperatorCredential. `*.signing_alg` /
+        # `*.format` / `*.vct` MUST match the realm's signing key and what
+        # the Verifier expects (see provider verifier `keyAlgorithm: ES256`).
+        # expiry_in_s = 1 year.
+        attributes:
+          vc.operator-credential.expiry_in_s: "31536000"
+          vc.operator-credential.format: vc+sd-jwt
+          vc.operator-credential.scope: OperatorCredential
+          vc.operator-credential.vct: OperatorCredential
+          vc.operator-credential.credential_signing_alg_values_supported: ES256
+          vc.operator-credential.credential_build_config.token_jws_type: vc+sd-jwt
+          vc.operator-credential.credential_build_config.visible_claims: roles,email
+          vc.operator-credential.credential_build_config.proof_types_supported: "{\"jwt\":{\"proof_signing_alg_values_supported\":[\"ES256\"]}}"
+          vc.operator-credential.credential_build_config.decoys: "3"
+          vc.operator-credential.credential_build_config.signing_algorithm: ES256
+        # SMTP for Keycloak emails (account verification, password reset).
+        # YAML anchors (&smtpHost / &smtpPort) re-used by `config.email` below
+        # so host/port live in one place. Credentials come from `extraEnvVars`.
+        smtpServer:
+          host: &smtpHost "smtp.gmail.com"
+          port: &smtpPort 587
+          auth: true
+          user: "${SMTP_USER}"
+          password: "${SMTP_PASSWORD}"
+          starttls: true
+          ssl: false
+          from: "example@email.com"
+          fromDisplayName: "Onboarding Auth"
+  # nodemailer wired to the same SMTP server as Keycloak. Used by the
+  # onboarding portal itself for participant-onboarding notifications.
+  email:
+    enabled: true
+    type: nodemailer
+    from: "example@email.com"
+    config:
+      host: *smtpHost
+      port: *smtpPort
+      auth:
+        user: "${SMTP_USER}"
+        pass: "${SMTP_PASSWORD}"
+  # Onboarding's own DID — distinct from the provider's. Document resolved at
+  # https://did-onboarding.example.com/did/did.json (served by a separate did:web pod).
+  didGenerator:
+    didWebHost: did:web:did-onboarding.example.com
+
+# SMTP credentials sourced from the externally-provisioned `onboarding-secrets`.
+extraEnvVars:
+  - name: SMTP_USER
+    valueFrom:
+      secretKeyRef:
+        name: onboarding-secrets
+        key: smtp-user
+  - name: SMTP_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: onboarding-secrets
+        key: smtp-password
+
+# AWS ALB Ingress. `alb.ingress.kubernetes.io/group.name: shared-alb` packs
+# multiple Ingresses behind a single ALB (cost-saver: one ALB per group
+# instead of one per Ingress). Adapt `className` for non-EKS clusters.
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    cert-manager.io/cluster-issuer: prod
+    cert-manager.io/common-name: onboarding.example.com
+    cert-manager.io/private-key-algorithm: ECDSA
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: shared-alb
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+  hosts:
+    - host: onboarding.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts:
+      - onboarding.example.com
+      secretName: onboarding.example.com-tls
+persistence:
+  create: true
+  enabled: true
+  storageClass: gp2  # AWS EKS — change for non-EKS clusters

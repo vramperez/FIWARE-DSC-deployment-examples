@@ -10,12 +10,16 @@ one per dataspace role.
 
 ## Layout
 
-| Role               | File                                              | Chart                | Version |
-| ------------------ | ------------------------------------------------- | -------------------- | ------- |
-| Operator           | `operator/trust-anchor.yaml`                      | `dsc/trust-anchor`   | 1.0.0   |
-| Consumer           | `consumer/consumer.yaml`                          | `dsc/data-space-connector` | 9.0.3 |
-| Provider           | `provider/provider.yaml`                          | `dsc/data-space-connector` | 9.0.3 |
-| Consumer + Provider| `consumer-and-provider/consumer-and-provider.yaml`| `dsc/data-space-connector` | 9.0.3 |
+| Role                | File                                              | Chart                       | Version | Notes                                  |
+| ------------------- | ------------------------------------------------- | --------------------------- | ------- | -------------------------------------- |
+| Operator            | `operator/trust-anchor.yaml`                      | `dsc/trust-anchor`          | 1.0.0   |                                        |
+| Operator            | `operator/central-marketplace.yaml`               | `dsc/data-space-connector`  | 9.0.3   | Central marketplace (BAE + IdP)        |
+| Operator            | `operator/onboarding-portal.yaml`                 | onboarding-portal chart     | —       | Participant onboarding UI              |
+| Consumer            | `consumer/consumer.yaml`                          | `dsc/data-space-connector`  | 9.0.3   |                                        |
+| Provider            | `provider/provider.yaml`                          | `dsc/data-space-connector`  | 9.0.3   |                                        |
+| Provider            | `provider/provider-central-marketplace.yaml`      | `dsc/data-space-connector`  | 9.0.3   | Provider as central-marketplace peer   |
+| Provider (overlay)  | `provider/fdsc-dashboard.yaml`                    | —                           | —       | Dashboard ALB Ingress overlay          |
+| Consumer + Provider | `consumer-and-provider/consumer-and-provider.yaml`| `dsc/data-space-connector`  | 9.0.3   |                                        |
 
 ## Prerequisites
 

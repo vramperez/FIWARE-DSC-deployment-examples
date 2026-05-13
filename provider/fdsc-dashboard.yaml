@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCLAIMER — Training / educational example only.
+# Do NOT deploy as-is in production. Rotate the APISIX `adminKey`, review
+# Keycloak client/role mapping, and confirm hostnames + cert issuer.
+# ─────────────────────────────────────────────────────────────────────────────
+# Overlay for the `fdsc-dashboard` subchart — operator UI for TIL/CCS/ODRL-PAP
+# /APISIX. Replaces the nginx Ingress declared in `provider.yaml` with an AWS
+# ALB Ingress and re-points APISIX at the central marketplace deployment.
+
+fdsc-dashboard:
+  enabled: true
+  # AWS ALB Ingress. `alb.ingress.kubernetes.io/group.name: shared-alb` packs
+  # multiple Ingresses behind a single ALB (cost-saver: one ALB per group
+  # instead of one per Ingress). Adapt `className` for non-EKS clusters.
+  ingress:
+    enabled: true
+    className: alb
+    annotations:
+      kubernetes.io/ingress.class: alb
+      cert-manager.io/cluster-issuer: prod
+      cert-manager.io/private-key-algorithm: ECDSA
+      alb.ingress.kubernetes.io/group.name: shared-alb
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+
+    hosts:
+      - host: dashboard-provider.example.com
+        paths:
+          - "/"
+    tls:
+      - secretName: dashboard-provider.example.com-tls
+        hosts:
+          - dashboard-provider.example.com
+  # Service name pattern is <helm-release>-apisix-admin. Here the release is
+  # `provider-central-mp` — update if you rename the release.
+  # `adminKey: admin` is the APISIX default; rotate and source from a Secret in prod.
+  apisix:
+    enabled: true
+    dashboardUrl: http://provider-central-mp-apisix-admin:9180/ui
+    adminKey: admin
+  # In-cluster URLs for the services the dashboard administers.
+  apiUrls:
+    til: http://trusted-issuers-list:8080
+    ccs: http://credentials-config-service:8080
+    odrl: http://odrl-pap:8080
+  # OIDC login against the provider's Keycloak. Roles come from the `client_roles`
+  # claim (emitted by the dashboard client's role mapper) and are mapped to the
+  # dashboard's internal `admin` role.
+  auth:
+    config:
+      providers:
+        - id: keycloak
+          displayName: Keycloak
+          issuer: https://accounts.example.com/realms/provider
+          clientId: dashboard # Requires a client in Keycloak with this ID
+          scopes: ["openid", "profile", "roles"]
+          rolesClaimPath: "client_roles"
+          roleMapping:
+            admin: "admin" # Requires user(s) in Keycloak with this role for admin access
+          silentRenew: true
