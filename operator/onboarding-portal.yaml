@@ -253,20 +253,13 @@ extraEnvVars:
         name: onboarding-secrets
         key: smtp-password
 
-# AWS ALB Ingress. `alb.ingress.kubernetes.io/group.name: shared-alb` packs
-# multiple Ingresses behind a single ALB (cost-saver: one ALB per group
-# instead of one per Ingress). Adapt `className` for non-EKS clusters.
 ingress:
   enabled: true
-  className: alb
+  className: nginx
   annotations:
     cert-manager.io/cluster-issuer: prod
     cert-manager.io/common-name: onboarding.example.com
     cert-manager.io/private-key-algorithm: ECDSA
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/group.name: shared-alb
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
   hosts:
     - host: onboarding.example.com
       paths:
