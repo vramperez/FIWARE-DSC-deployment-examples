@@ -3,7 +3,7 @@
 # Do NOT deploy as-is in production. Review credentials, hostnames, cert
 # issuers, resource sizing, persistence, and disabled subcharts first.
 # ─────────────────────────────────────────────────────────────────────────────
-# Consumer + Provider deployment example for DSC chart 9.0.3.
+# Consumer + Provider deployment example for DSC chart 10.3.2.
 # Same provider stack as ../provider/provider.yaml + consumer-side VC issuance
 # so this participant can also consume from peer providers.
 #
@@ -203,10 +203,10 @@ decentralizedIam:
                           - id: roles
                             path: [$.roles]
                       format:
-                        "vc+sd-jwt":
+                        "dc+sd-jwt":
                           alg: [ES256]
                   format:
-                    "vc+sd-jwt":
+                    "dc+sd-jwt":
                       alg: [ES256]
 
           # ── Operator scope for accessing Scorpio via APISIX
@@ -238,10 +238,10 @@ decentralizedIam:
                           - id: roles
                             path: [$.roles]
                       format:
-                        "vc+sd-jwt":
+                        "dc+sd-jwt":
                           alg: [ES256]
                   format:
-                    "vc+sd-jwt":
+                    "dc+sd-jwt":
                       alg: [ES256]
 
     # Verifier: OIDC endpoint that exchanges a VC for a JWT (via OID4VP).
@@ -376,10 +376,13 @@ decentralizedIam:
               with_body: true
 
     # ODRL-PAP: policy admin point; exposes ODRL policies as an OPA bundle.
-    # Command is overridden to inject GENERAL_ORGANIZATION_DID (not picked up by entrypoint in 1.4.x).
+    # 10.x reads GENERAL_ORGANIZATION_DID from env directly (no command override needed).
     odrl-pap:
       enabled: true
       fullnameOverride: odrl-pap
+      additionalEnvVars:
+        - name: GENERAL_ORGANIZATION_DID
+          value: did:web:did-coprov.example.com:did
       database:
         url: jdbc:postgresql://postgres:5432/papdb
         username: pap
@@ -387,16 +390,6 @@ decentralizedIam:
           enabled: true
           name: pap.postgres.credentials.postgresql.acid.zalan.do
           key: password
-      deployment:
-        image:
-          tag: 1.4.3
-        command: [/bin/sh]
-        args:
-          - -ec
-          - |
-            #!/bin/sh
-            export GENERAL_ORGANIZATION_DID=did:web:did-coprov.example.com:did
-            ./application -Dquarkus.http.host=0.0.0.0
       ingress:
         enabled: false
 
@@ -419,9 +412,7 @@ decentralizedIam:
 scorpio:
   enabled: true
   fullnameOverride: data-service-scorpio
-  image:
-    repository: scorpiobroker/all-in-one-runner
-    tag: java-4.1.10
+  # Image pin removed — the umbrella 10.3.2 default (all-in-one-runner:java-4.1.10) governs.
   db:
     dbhost: postgres                     # 8.x: data-service-postgis
     user: scorpio
@@ -442,54 +433,51 @@ scorpio:
 
 # Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI).
 # The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
-# Bitnami moved the image to `bitnamilegacy/keycloak`; override repo + allowInsecureImages,
-# otherwise ImagePullBackOff.
+# DSC 10.x uses the CloudPirates Keycloak chart with the SEAMWARE-patched upstream
+# image (quay.io/seamware/keycloak:26.6.3) as the umbrella default.
 keycloak:
   enabled: true
-  kubeVersion: 1.34-1
   metrics: { enabled: true }
-  global:
-    security:
-      allowInsecureImages: true
-  image:
-    repository: bitnamilegacy/keycloak
-  containerSecurityContext: { enabled: false }
+  keycloak:
+    adminUser: keycloak-admin
+    existingSecret: issuance-secret
+    secretKeys:
+      adminPasswordKey: keycloak-admin
+    proxyHeaders: xforwarded
+  tls: { enabled: false }
+  service:
+    httpPort: 8080
   ingress:
-    pathType: Prefix
+    enabled: true
+    ingressClassName: nginx
     annotations:
       cert-manager.io/common-name: accounts-coprov.example.com
       cert-manager.io/cluster-issuer: prod
       kubernetes.io/ingress.class: nginx
-    enabled: true
-    hostname: accounts-coprov.example.com
-    ingressClassName: nginx
-    tls: true
-  proxyHeaders: xforwarded
-  proxy: edge
-  tls: { enabled: false }
-  service:
-    ports: { http: 8080 }
-    extraPorts:
-      - { name: management, port: 9000, targetPort: 9000 }
-  auth:
-    existingSecret: issuance-secret
-    passwordSecretKey: keycloak-admin
-    adminUser: keycloak-admin
+    hosts:
+      - host: accounts-coprov.example.com
+        paths:
+          - { path: /, pathType: Prefix }
+    tls:
+      - secretName: accounts-coprov.example.com-tls
+        hosts: [accounts-coprov.example.com]
   resources:
     requests: { memory: "500Mi", cpu: "0.5" }
     limits:   { memory: "2Gi",   cpu: "1" }
   livenessProbe:  { failureThreshold: 20 }
   readinessProbe: { failureThreshold: 20 }
-  postgresql: { enabled: false }
-  externalDatabase:
+  postgres: { enabled: false }
+  database:
     host: postgres
-    database: keycloakdb
-    user: keycloak
+    name: keycloakdb
+    username: keycloak
     existingSecret: keycloak.postgres.credentials.postgresql.acid.zalan.do
-    existingSecretPasswordKey: password
+    secretKeys:
+      usernameKey: username
+      passwordKey: password
   extraVolumeMounts:
     - { name: did-material, mountPath: /did-material }
-    - { name: realms,       mountPath: /opt/bitnami/keycloak/data/import }
+    - { name: realms,       mountPath: /opt/keycloak/data/import }
   extraVolumes:
     - name: did-material
       emptyDir: {}
@@ -502,9 +490,9 @@ keycloak:
       secret: { secretName: ca-cert }
   # Builds a PKCS12 keystore from the cert-manager PEM keypair (Keycloak signs VCs
   # from PKCS12, not PEM). Alias `didPrivateKey` matches `signingKey.keyAlias`.
-  initContainers:
+  extraInitContainers:
     - name: get-did
-      image: alpine/openssl:latest
+      image: alpine/openssl:3.5.5
       command: ["/bin/sh", "-c"]
       args:
         - |
@@ -524,14 +512,10 @@ keycloak:
         - { name: did-material, mountPath: /did-material }
         - { name: did-priv-key, mountPath: /certs-did }
         - { name: ca-cert,      mountPath: /ca-certs }
-  # KC_FEATURES=oid4vc-vci   → enables the OID4VCI issuer (preview feature).
-  # --import-realm           → loads the realm JSON from `keycloak.realm` on startup.
-  # DID                      → substituted into ${DID} at realm import time.
+  # The umbrella enables the OID4VCI feature flags and `--import-realm` by default.
+  # extraEnvVars REPLACES the umbrella list, so KC_HEAP_SIZE must be repeated here.
+  # DID → substituted into ${DID} at realm import time.
   extraEnvVars:
-    - name: KEYCLOAK_EXTRA_ARGS
-      value: "--import-realm --health-enabled true"
-    - name: KC_FEATURES
-      value: "oid4vc-vci"
     - name: KC_HEAP_SIZE
       value: "1024m"
     - name: DID
@@ -545,8 +529,9 @@ keycloak:
     import: true
     name: coprov
     frontendUrl: https://accounts-coprov.example.com
-    attributes:
-      sslRequired: "none"
+    sslRequired: none
+    wallets:
+      issueCredentialsToUsers: true
 
     # Client roles per Keycloak client.
     # ${DID}                                 → self-client (LegalPersonCredential)
@@ -628,124 +613,145 @@ keycloak:
         defaultClientScopes: []
         optionalClientScopes: []
 
+      # OIDC client backing the FDSC dashboard login (clientId == dashboard).
+      - clientId: dashboard
+        enabled: true
+        description: Client to access the FDSC dashboard
+        surrogateAuthRequired: false
+        alwaysDisplayInConsole: false
+        clientAuthenticatorType: client-secret
+        defaultRoles: []
+        redirectUris:
+          - https://dashboard-coprov.example.com/callback/keycloak
+        webOrigins:
+          - https://dashboard-coprov.example.com
+        notBefore: 0
+        bearerOnly: false
+        consentRequired: false
+        standardFlowEnabled: true
+        implicitFlowEnabled: false
+        directAccessGrantsEnabled: false
+        serviceAccountsEnabled: false
+        publicClient: true
+        frontchannelLogout: false
+        protocol: openid-connect
+        protocolMappers:
+          - name: client-roles-mapper
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-client-role-mapper
+            consentRequired: false
+            config:
+              multivalued: "true"
+              userinfo.token.claim: "true"
+              id.token.claim: "true"
+              access.token.claim: "true"
+              claim.name: "client_roles"
+              jsonType.label: "String"
+              usermodel.clientRoleMapping.clientId: "dashboard"
+        authenticationFlowBindingOverrides: {}
+        fullScopeAllowed: true
+        nodeReRegistrationTimeout: -1
+        defaultClientScopes: ["openid", "profile", "roles"]
+        optionalClientScopes: []
 
-    # VC types this realm issues (OID4VCI). Each entry → client scope + issuer metadata.
-    # `credential_signing_alg_values_supported` MUST match `signingKey.keyAlgorithm`
-    # and the algorithm of the key inside the PKCS12 keystore.
-    # Mappers populate `credentialSubject`:
+
+    # VC types this realm issues (OID4VCI, post-KC 26.4 model). Each entry renders one
+    # ClientScope (protocol "oid4vc"); the key is the credential_configuration_id.
+    # `credential_signing_alg` MUST match `signingKey.keyAlgorithm` and the key inside
+    # the PKCS12 keystore. Mappers populate `credentialSubject`:
     #   oid4vc-context-mapper        → JSON-LD @context entries
-    #   oid4vc-user-attribute-mapper → copy Keycloak user attribute → VC claim
+    #   oid4vc-user-attribute-mapper → copy Keycloak user attribute → VC claim (claim.name)
     #   oid4vc-target-role-mapper    → roles on client `config.clientId`, scoped to that target DID
     verifiableCredentials:
 
       # Identity credential — self-issued, roles scoped to this participant's own DID.
       legal-person-sd:
         attributes:
-          credential_signing_alg_values_supported: ES256
-          credential_build_config.signing_algorithm: ES256
-          credential_build_config.token_jws_type: vc+sd-jwt
-          credential_build_config.proof_types_supported:
-            jwt:
-              proof_signing_alg_values_supported:
-                - ES256
-          format: vc+sd-jwt
-          scope: LegalPersonCredential
-          vct: LegalPersonCredential
-          credential_build_config.visible_claims: roles,email
-          credential_build_config.decoys: 3
-        clientScope:
-          create: true
+          format: "dc+sd-jwt"
+          verifiable_credential_type: "LegalPersonCredential"
+          credential_signing_alg: "ES256"
+          credential_build_config.token_jws_type: "dc+sd-jwt"
+          credential_build_config.sd_jwt.visible_claims: "iss,iat,nbf,exp,cnf,vct,status,roles,email"
+          sd_jwt.number_of_decoys: "3"
+          binding_required: "false"
+          binding_required_proof_types: "jwt"
+          cryptographic_binding_methods_supported: "jwk"
         protocolMappers:
-          - name: context-mapper
+          - name: context-mapper-lps
             protocol: oid4vc
             protocolMapper: oid4vc-context-mapper
             config:
               context: https://www.w3.org/2018/credentials/v1
-              supportedCredentialTypes: LegalPersonCredential
-          - name: email-mapper
+          - name: email-mapper-lps
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: email
+              claim.name: email
               userAttribute: email
-              supportedCredentialTypes: LegalPersonCredential
-          - name: firstName-mapper
+          - name: firstName-mapper-lps
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: firstName
+              claim.name: firstName
               userAttribute: firstName
-              supportedCredentialTypes: LegalPersonCredential
-          - name: lastName-mapper
+          - name: lastName-mapper-lps
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: lastName
+              claim.name: lastName
               userAttribute: lastName
-              supportedCredentialTypes: LegalPersonCredential
-          - name: role-mapper
+          - name: role-mapper-lps
             protocol: oid4vc
             protocolMapper: oid4vc-target-role-mapper
             config:
-              subjectProperty: roles
+              claim.name: roles
               clientId: ${DID}
-              supportedCredentialTypes: LegalPersonCredential
 
       # Access credential — roles scoped to the peer provider's DID.
       # Duplicate this block per peer you consume from, changing role-mapper.clientId.
       operator-sd:
         attributes:
-          credential_signing_alg_values_supported: ES256
-          credential_build_config.signing_algorithm: ES256
-          credential_build_config.token_jws_type: vc+sd-jwt
-          credential_build_config.proof_types_supported:
-            jwt:
-              proof_signing_alg_values_supported:
-                - ES256
-          format: vc+sd-jwt
-          scope: OperatorCredential
-          vct: OperatorCredential
-          credential_build_config.visible_claims: roles,email
-          credential_build_config.decoys: 3
-        clientScope:
-          create: true
+          format: "dc+sd-jwt"
+          verifiable_credential_type: "OperatorCredential"
+          credential_signing_alg: "ES256"
+          credential_build_config.token_jws_type: "dc+sd-jwt"
+          credential_build_config.sd_jwt.visible_claims: "iss,iat,nbf,exp,cnf,vct,status,roles,email"
+          sd_jwt.number_of_decoys: "3"
+          binding_required: "false"
+          binding_required_proof_types: "jwt"
+          cryptographic_binding_methods_supported: "jwk"
         protocolMappers:
-          - name: context-mapper
+          - name: context-mapper-ops
             protocol: oid4vc
             protocolMapper: oid4vc-context-mapper
             config:
               context: https://www.w3.org/2018/credentials/v1
-              supportedCredentialTypes: OperatorCredential
-          - name: email-mapper
+          - name: email-mapper-ops
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: email
+              claim.name: email
               userAttribute: email
-              supportedCredentialTypes: OperatorCredential
-          - name: firstName-mapper
+          - name: firstName-mapper-ops
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: firstName
+              claim.name: firstName
               userAttribute: firstName
-              supportedCredentialTypes: OperatorCredential
-          - name: lastName-mapper
+          - name: lastName-mapper-ops
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: lastName
+              claim.name: lastName
               userAttribute: lastName
-              supportedCredentialTypes: OperatorCredential
-          - name: role-mapper
+          - name: role-mapper-ops
             protocol: oid4vc
             protocolMapper: oid4vc-target-role-mapper
             config:
-              subjectProperty: roles
+              claim.name: roles
               clientId: did:web:did-partner.example.com:did
-              supportedCredentialTypes: OperatorCredential
 
-  # `keyAlgorithm` must match the PKCS12 key and `credential_signing_alg_values_supported`.
+  # `keyAlgorithm` must match the PKCS12 key and each VC's `credential_signing_alg`.
   signingKey:
     storePath: /did-material/cert.pfx
     storePassword: "${STORE_PASS}"
@@ -811,8 +817,7 @@ contract-management:
     enabled: true
     host: contract-management
   deployment:
-    image:
-      tag: 3.3.8
+    # Image pin removed — umbrella 10.3.2 default (contract-management ≥3.3.9) governs.
     initContainers:
       - name: wait-for-keycloak
         image: curlimages/curl:8.6.0
@@ -821,7 +826,7 @@ contract-management:
           - |
             set -e
             echo "Waiting for Keycloak to become ready..."
-            until curl -sf http://coprov-keycloak:9000/health/ready > /dev/null; do
+            until curl -sf http://coprov-keycloak-metrics:9000/health/ready > /dev/null; do
               echo "Keycloak not ready yet, retrying..."
               sleep 5
             done
@@ -1018,8 +1023,6 @@ marketplace:
   # Billing/pricing engine. Wired to local TMForum CustomerBill + Party APIs.
   bizEcosystemChargingBackend:
     deployment:
-      image:
-        tag: 11.4.0
       livenessProbe:
         initialDelaySeconds: 20
       readinessProbe:
@@ -1092,8 +1095,6 @@ marketplace:
         initialDelaySeconds: 20
       readinessProbe:
         initialDelaySeconds: 20
-      image:
-        tag: 11.15.0
     ingress:
       enabled: true
       className: nginx

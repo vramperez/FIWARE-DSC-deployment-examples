@@ -260,11 +260,11 @@ decentralizedIam:
                             path:
                               - $.roles
                       format:
-                        "vc+sd-jwt":
+                        "dc+sd-jwt":
                           alg:
                             - ES256
                   format:
-                    "vc+sd-jwt":
+                    "dc+sd-jwt":
                       alg:
                         - ES256
               "openid learcredential":
@@ -295,11 +295,11 @@ decentralizedIam:
                             path:
                               - $.roles
                       format:
-                        "vc+sd-jwt":
+                        "dc+sd-jwt":
                           alg:
                             - ES256
                   format:
-                    "vc+sd-jwt":
+                    "dc+sd-jwt":
                       alg:
                         - ES256
 
@@ -312,10 +312,7 @@ decentralizedIam:
 scorpio:
   fullnameOverride: data-service-scorpio
   enabled: true
-  image:
-    # Resource-friendly all-in-one image (Kafka-less, Java build).
-    repository: scorpiobroker/all-in-one-runner
-    tag: java-4.1.10
+  # Image inherited from the umbrella default (scorpiobroker/all-in-one-runner:java-4.1.10).
   db:
     dbhost: postgres
     user: scorpio
@@ -348,48 +345,39 @@ scorpio:
 
 # Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI). Realm `central`.
 # The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
-# Bitnami moved the image to `bitnamilegacy/keycloak`; override repo + allowInsecureImages,
-# otherwise ImagePullBackOff.
+# DSC 10.x uses the CloudPirates Keycloak chart with the SEAMWARE-patched upstream
+# image (quay.io/seamware/keycloak:26.6.3) as the umbrella default — no image override.
 keycloak:
-  kubeVersion: 1.34-1
+  enabled: true
   metrics:
     enabled: true
-  enabled: true
-  global:
-    security:
-      allowInsecureImages: true
-  image:
-    repository: bitnamilegacy/keycloak
-  # Quarkus image requires the container security context disabled (fixed in future chart versions).
-  containerSecurityContext:
+  # Admin credentials live under the CloudPirates `keycloak.keycloak.*` block.
+  keycloak:
+    adminUser: keycloak-admin
+    existingSecret: issuance-secret
+    secretKeys:
+      adminPasswordKey: keycloak-admin
+    proxyHeaders: xforwarded
+  tls:
     enabled: false
+  service:
+    httpPort: 8080
   ingress:
-    pathType: Prefix
+    enabled: true
+    ingressClassName: nginx
     annotations:
       cert-manager.io/common-name: accounts-central.example.com
       cert-manager.io/cluster-issuer: prod
       kubernetes.io/ingress.class: "nginx"
-    enabled: true
-    hostname: accounts-central.example.com
-    ingressClassName: nginx
-    tls: true
-  proxyHeaders: xforwarded
-  proxy: edge
-  tls:
-    enabled: false
-  service:
-    ports:
-      http: 8080
-    extraPorts:
-      - name: management
-        port: 9000
-        targetPort: 9000
-  auth:
-    existingSecret: issuance-secret
-    passwordSecretKey: keycloak-admin
-    adminUser: keycloak-admin
+    hosts:
+      - host: accounts-central.example.com
+        paths:
+          - { path: /, pathType: Prefix }
+    tls:
+      - secretName: accounts-central.example.com-tls
+        hosts: [accounts-central.example.com]
 
-  # Bumped above Bitnami defaults to prevent OOMs on linux kernel >=6.14.
+  # Bumped above chart defaults to prevent OOMs on linux kernel >=6.14.
   resources:
     requests:
       memory: "500Mi"
@@ -404,19 +392,21 @@ keycloak:
   readinessProbe:
     failureThreshold: 20
 
-  postgresql:
+  postgres:
     enabled: false
-  externalDatabase:
+  database:
     host: postgres
-    database: keycloak
-    user: keycloak
+    name: keycloak
+    username: keycloak
     existingSecret: keycloak.postgres.credentials.postgresql.acid.zalan.do
-    existingSecretPasswordKey: password
+    secretKeys:
+      usernameKey: username
+      passwordKey: password
 
   extraVolumeMounts:
     - mountPath: /did-material
       name: did-material
-    - mountPath: /opt/bitnami/keycloak/data/import
+    - mountPath: /opt/keycloak/data/import
       name: realms
   extraVolumes:
     - emptyDir: {}
@@ -433,9 +423,9 @@ keycloak:
         secretName: ca-cert
   # Builds a PKCS12 keystore from the cert-manager PEM keypair (Keycloak signs
   # VCs from PKCS12, not PEM). Alias `didPrivateKey` matches `signingKey.keyAlias`.
-  initContainers:
+  extraInitContainers:
     - name: get-did
-      image: alpine/openssl:latest
+      image: alpine/openssl:3.5.5
       command: ["/bin/sh", "-c"]
       args:
         - |
@@ -460,15 +450,10 @@ keycloak:
           mountPath: /certs-did
         - name: ca-cert
           mountPath: /ca-certs
-  # KC_FEATURES=oid4vc-vci → enables the OID4VCI issuer (preview feature).
-  # --import-realm         → loads the realm JSON from `keycloak.realm` on startup.
-  # KC_HEAP_SIZE           → matches the memory requests; otherwise OOM.
-  # DID                    → substituted into ${DID} at realm import time.
+  # The umbrella enables the OID4VCI feature flags and `--import-realm` by default.
+  # extraEnvVars REPLACES the umbrella list, so KC_HEAP_SIZE must be repeated here.
+  # DID → substituted into ${DID} at realm import time.
   extraEnvVars:
-    - name: KEYCLOAK_EXTRA_ARGS
-      value: "--import-realm --health-enabled true"
-    - name: KC_FEATURES
-      value: "oid4vc-vci"
     - name: KC_HEAP_SIZE
       value: "1024m"
     - name: DID
@@ -482,7 +467,12 @@ keycloak:
   realm:
     import: true
     name: central
-    frontendURL: https://accounts-central.example.com
+    frontendUrl: https://accounts-central.example.com
+    sslRequired: none
+    # SEAMWARE-patched KC ties /create-credential-offer to a per-user
+    # verifiableCredentials list; auto-assign the full declared set to every user.
+    wallets:
+      issueCredentialsToUsers: true
 
     # Convention: ONE client per *target participant*, `clientId == that peer's DID`.
     # Roles assigned on that client → emitted in the VC with `target` = that DID
@@ -554,89 +544,69 @@ keycloak:
         nodeReRegistrationTimeout: -1
         defaultClientScopes: []
         optionalClientScopes: []
-    # VC types this realm issues (OID4VCI):
-    #   user-sd               → SD-JWT LegalPersonCredential for participant login
+    # VC types this realm issues (OID4VCI, post-KC 26.4 model). Each entry renders
+    # one ClientScope (protocol "oid4vc"); the key is the credential_configuration_id.
+    #   user-sd                → SD-JWT LegalPersonCredential for participant login
     #   marketplace-credential → JWT VC consumed by contract-management for API access
-    # `credential_signing_alg_values_supported` MUST match `signingKey.keyAlgorithm`
-    # and the algorithm of the key inside the PKCS12 keystore.
+    # `credential_signing_alg` MUST match `signingKey.keyAlgorithm` and the key in
+    # the PKCS12 keystore.
     verifiableCredentials:
       user-sd:
         attributes:
-          credential_signing_alg_values_supported: ES256
-          credential_build_config.signing_algorithm: ES256
-          credential_build_config.token_jws_type: vc+sd-jwt
-          credential_build_config.proof_types_supported:
-            jwt:
-              proof_signing_alg_values_supported:
-                - ES256
-          format: vc+sd-jwt
-          scope: LegalPersonCredential
-          vct: LegalPersonCredential
-          credential_build_config.visible_claims: roles,email
-          credential_build_config.decoys: 3
-        clientScope:
-          create: true
+          format: "dc+sd-jwt"
+          verifiable_credential_type: "LegalPersonCredential"
+          credential_signing_alg: "ES256"
+          credential_build_config.token_jws_type: "dc+sd-jwt"
+          credential_build_config.sd_jwt.visible_claims: "iss,iat,nbf,exp,cnf,vct,status,roles,email"
+          sd_jwt.number_of_decoys: "3"
+          binding_required: "false"
+          binding_required_proof_types: "jwt"
+          cryptographic_binding_methods_supported: "jwk"
         protocolMappers:
-          - name: context-mapper
+          - name: context-mapper-usd
             protocol: oid4vc
             protocolMapper: oid4vc-context-mapper
             config:
               context: https://www.w3.org/2018/credentials/v1
-              supportedCredentialTypes: LegalPersonCredential
-          - name: email-mapper
+          - name: email-mapper-usd
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: email
+              claim.name: email
               userAttribute: email
-              supportedCredentialTypes: LegalPersonCredential
-          - name: firstName-mapper
+          - name: firstName-mapper-usd
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: firstName
+              claim.name: firstName
               userAttribute: firstName
-              supportedCredentialTypes: LegalPersonCredential
-          - name: lastName-mapper
+          - name: lastName-mapper-usd
             protocol: oid4vc
             protocolMapper: oid4vc-user-attribute-mapper
             config:
-              subjectProperty: lastName
+              claim.name: lastName
               userAttribute: lastName
-              supportedCredentialTypes: LegalPersonCredential
-          - name: role-mapper
+          - name: role-mapper-usd
             protocol: oid4vc
             protocolMapper: oid4vc-target-role-mapper
             config:
-              subjectProperty: roles
+              claim.name: roles
               clientId: ${DID}
-              supportedCredentialTypes: LegalPersonCredential
       # Plain JWT VC (not SD-JWT). Consumed by contract-management to call
       # other participants' TMForum APIs on behalf of the marketplace.
       marketplace-credential:
         attributes:
-          credential_signing_alg_values_supported: ES256
-          credential_build_config.signing_algorithm: ES256
-          credential_build_config.token_jws_type: JWT
-          credential_build_config.proof_types_supported:
-            jwt:
-              proof_signing_alg_values_supported:
-                - ES256
-          format: jwt_vc
-          scope: MarketplaceCredential
-          vct: MarketplaceCredential
-          credential_build_config.visible_claims: roles,email
-          credential_build_config.decoys: 3
-        clientScope:
-          create: true
+          format: "jwt_vc_json"
+          verifiable_credential_type: "MarketplaceCredential"
+          credential_signing_alg: "ES256"
+          credential_build_config.token_jws_type: "JWT"
         protocolMappers:
-          - name: context-mapper
+          - name: context-mapper-mpc
             protocol: oid4vc
             protocolMapper: oid4vc-context-mapper
             config:
               context: https://www.w3.org/2018/credentials/v1
-              supportedCredentialTypes: MarketplaceCredential
-  # `keyAlgorithm` must match the PKCS12 key and `credential_signing_alg_values_supported`.
+  # `keyAlgorithm` must match the PKCS12 key and each VC's `credential_signing_alg`.
   signingKey:
     storePath: /did-material/cert.pfx
     storePassword: "${STORE_PASS}"
@@ -714,8 +684,7 @@ contract-management:
     - name: LOGGER_LEVELS_ROOT
       value: DEBUG
   deployment:
-    image:
-      tag: 3.3.8
+    # Image tag inherited from the umbrella default (contract-management ≥ 3.3.9).
     # Bootstrap chain:
     #   1. wait-for-keycloak  → blocks until KC /health/ready responds
     #   2. get-credential     → fetches the marketplace-credential JWT into /credential-repo
@@ -730,7 +699,7 @@ contract-management:
             set -e
             echo "Waiting for Keycloak to become ready..."
 
-            until curl -sf http://central-marketplace-keycloak:9000/health/ready > /dev/null; do
+            until curl -sf http://central-marketplace-keycloak-metrics:9000/health/ready > /dev/null; do
               echo "Keycloak not ready yet, retrying..."
               sleep 5
             done
@@ -836,8 +805,7 @@ marketplace:
   # Billing/pricing engine. Wired to local TMForum CustomerBill + Party APIs.
   bizEcosystemChargingBackend:
     deployment:
-      image:
-        tag: 11.4.0
+      # Image tag inherited from the business-api-ecosystem subchart default.
       livenessProbe:
         initialDelaySeconds: 20
       readinessProbe:
@@ -910,8 +878,7 @@ marketplace:
         initialDelaySeconds: 20
       readinessProbe:
         initialDelaySeconds: 20
-      image:
-        tag: 11.15.0
+      # Image tag inherited from the business-api-ecosystem subchart default.
     ingress:
       enabled: true
       className: nginx
@@ -970,7 +937,7 @@ credentials:
     password: *employee_password
   configurations:
     - id: marketplace-credential
-      format: jwt_vc
+      format: jwt_vc_json
       targetFile: marketplace-credential.jwt
 
 # Extra raw manifests:
