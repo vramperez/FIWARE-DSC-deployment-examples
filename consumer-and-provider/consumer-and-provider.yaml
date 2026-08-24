@@ -3,7 +3,7 @@
 # Do NOT deploy as-is in production. Review credentials, hostnames, cert
 # issuers, resource sizing, persistence, and disabled subcharts first.
 # ─────────────────────────────────────────────────────────────────────────────
-# Consumer + Provider deployment example for DSC chart 10.3.2.
+# Consumer + Provider deployment example for DSC chart 10.4.12.
 # Same provider stack as ../provider/provider.yaml + consumer-side VC issuance
 # so this participant can also consume from peer providers.
 #
@@ -152,24 +152,25 @@ decentralizedIam:
         til: { enabled: false }
         tir: { enabled: false }
 
-    # CCS: per-service config "to access X, present VC of type Y from issuer Z".
-    # `${DID}` is a runtime env var exported by `prepScript`, NOT a Helm template.
+    # CCS (Credentials Config Service) is embedded in the verifier in DSC 10.x
+    # (served by `vcverifier.deployment.configServer` on :8090). The standalone
+    # subchart stays disabled; its database + service registration now live under
+    # `vcverifier` below.
     credentials-config-service:
+      enabled: false
+
+    # Verifier: OIDC endpoint that exchanges a VC for a JWT (via OID4VP).
+    # Two keys mounted:
+    #   /certs         → ECDSA TLS cert for `x509_san_dns` client identification
+    #   /certs-signing → RSA token-signing key (RSA mandatory, see keyAlgorithm below)
+    vcverifier:
       enabled: true
-      fullnameOverride: credentials-config-service
-      ingress:
-        enabled: false
-      database:
-        persistence: true
-        dialect: POSTGRES
-        host: postgres
-        port: 5432
-        name: ccsdb
-        username: ccs
-        existingSecret:
-          enabled: true
-          name: ccs.postgres.credentials.postgresql.acid.zalan.do
-          key: password
+      fullnameOverride: verifier
+      m2m:
+        authEnabled: false
+      # Service registration (post-install job) posts each service's required
+      # credentials/scopes to the embedded CCS (configServer on :8090).
+      # `${DID}` is a runtime env var exported by `prepScript`, NOT a Helm template.
       registration:
         enabled: true
         prepScript: export DID=did:web:did-coprov.example.com:did
@@ -243,16 +244,6 @@ decentralizedIam:
                   format:
                     "dc+sd-jwt":
                       alg: [ES256]
-
-    # Verifier: OIDC endpoint that exchanges a VC for a JWT (via OID4VP).
-    # Two keys mounted:
-    #   /certs         → ECDSA TLS cert for `x509_san_dns` client identification
-    #   /certs-signing → RSA token-signing key (RSA mandatory, see keyAlgorithm below)
-    vcverifier:
-      enabled: true
-      fullnameOverride: verifier
-      m2m:
-        authEnabled: false
       ingress:
         enabled: true
         className: "nginx"
@@ -268,6 +259,18 @@ decentralizedIam:
           - secretName: verifier-coprov.example.com-tls
             hosts: [verifier-coprov.example.com]
       deployment:
+        # Embedded Credentials Config Service: serves the config REST API on :8090
+        # backed by the ccs database below — replaces the standalone CCS subchart.
+        configServer:
+          enabled: true
+        database:
+          name: ccsdb
+          host: postgres
+          type: postgres
+          existingSecret:
+            name: ccs.postgres.credentials.postgresql.acid.zalan.do
+            usernameKey: username
+            passwordKey: password
         logging: { level: debug }
         verifier:
           tirAddress: http://trusted-issuers-list:8080/
@@ -288,7 +291,7 @@ decentralizedIam:
         server:
           host: https://verifier-coprov.example.com
         configRepo:
-          configEndpoint: http://credentials-config-service:8080
+          configEndpoint: http://verifier:8090
         additionalVolumes:
           - name: certs-vol
             secret:
@@ -412,7 +415,7 @@ decentralizedIam:
 scorpio:
   enabled: true
   fullnameOverride: data-service-scorpio
-  # Image pin removed — the umbrella 10.3.2 default (all-in-one-runner:java-4.1.10) governs.
+  # Image pin removed — the umbrella 10.4.12 default (all-in-one-runner:java-4.1.10) governs.
   db:
     dbhost: postgres                     # 8.x: data-service-postgis
     user: scorpio
@@ -429,12 +432,17 @@ scorpio:
   service: { type: ClusterIP }
   ccs:
     enabled: false
-    endpoint: http://credentials-config-service:8080
+    endpoint: http://verifier:8090
 
 # Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI).
 # The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
-# DSC 10.x uses the CloudPirates Keycloak chart with the SEAMWARE-patched upstream
-# image (quay.io/seamware/keycloak:26.6.3) as the umbrella default.
+# DSC 10.4.x uses the CloudPirates Keycloak chart (0.21.28) with the UPSTREAM
+# image `docker.io/keycloak/keycloak:26.7.0` as the chart default — no image
+# override needed. The SEAMWARE fork (quay.io/seamware/keycloak:26.6.3) existed
+# only to carry the OID4VCI QR-endpoint fix (keycloak/keycloak#44623) and the
+# Liquibase changeset `26.7.0-verifiable-credential`; both are upstream in
+# 26.7.0, so it was dropped in 10.4.0. The umbrella still enables the three
+# oid4vc-vci feature flags.
 keycloak:
   enabled: true
   metrics: { enabled: true }
@@ -476,7 +484,13 @@ keycloak:
       usernameKey: username
       passwordKey: password
   extraVolumeMounts:
-    - { name: did-material, mountPath: /did-material }
+    # Since Keycloak 26.6.4 the `java-keystore` realm key provider only reads
+    # keystores under `${kc.home.dir}/data/<realm-name>` (/opt/keycloak/data on
+    # the official image). The directory name MUST equal `keycloak.realm.name`
+    # below; keystores outside that boundary break any update of the key provider.
+    # The `get-did` initContainer keeps its own /did-material view of the same
+    # emptyDir — only the Keycloak container's mount is constrained.
+    - { name: did-material, mountPath: /opt/keycloak/data/coprov }
     - { name: realms,       mountPath: /opt/keycloak/data/import }
   extraVolumes:
     - name: did-material
@@ -753,7 +767,7 @@ keycloak:
 
   # `keyAlgorithm` must match the PKCS12 key and each VC's `credential_signing_alg`.
   signingKey:
-    storePath: /did-material/cert.pfx
+    storePath: /opt/keycloak/data/coprov/cert.pfx
     storePassword: "${STORE_PASS}"
     keyAlias: didPrivateKey
     keyPassword: "${STORE_PASS}"
@@ -817,7 +831,7 @@ contract-management:
     enabled: true
     host: contract-management
   deployment:
-    # Image pin removed — umbrella 10.3.2 default (contract-management ≥3.3.9) governs.
+    # Image pin removed — umbrella 10.4.12 default (contract-management ≥3.3.9) governs.
     initContainers:
       - name: wait-for-keycloak
         image: curlimages/curl:8.6.0
@@ -916,7 +930,7 @@ fdsc-dashboard:
     adminKey: admin
   apiUrls:
     til: http://trusted-issuers-list:8080
-    ccs: http://credentials-config-service:8080
+    ccs: http://verifier:8090
     odrl: http://odrl-pap:8080
   auth:
     config:

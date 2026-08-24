@@ -8,9 +8,9 @@
 # namespace alongside the trust anchor / TIR; the central Keycloak is its IdP.
 #
 # ⚠️ NOT part of the DSC umbrella chart — this is the standalone On-Boarding-Portal
-# chart (image tag 0.1.0). It is NOT covered by the DSC 9.0.3 → 10.3.2 bump.
-# IMPORTANT: with DSC 10.x the central Keycloak is 26.4+ (CloudPirates / 26.6.3),
-# which removed the legacy OID4VCI model still used below — the flat
+# chart (image tag 0.1.0). It is NOT covered by the DSC 9.0.3 → 10.4.12 bump.
+# IMPORTANT: with DSC 10.4.x the central Keycloak is upstream 26.7.0 (CloudPirates
+# chart 0.21.28), which removed the legacy OID4VCI model still used below — the flat
 # `vc.operator-credential.*` realm attributes and the mapper keys
 # `supportedCredentialTypes` / `subjectProperty`. For this portal to work against
 # a 10.x central Keycloak you need an On-Boarding-Portal release that targets the

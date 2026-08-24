@@ -33,7 +33,7 @@ fdsc-dashboard:
   # In-cluster URLs for the services the dashboard administers.
   apiUrls:
     til: http://trusted-issuers-list:8080
-    ccs: http://credentials-config-service:8080
+    ccs: http://verifier:8090
     odrl: http://odrl-pap:8080
   # OIDC login against the provider's Keycloak. Roles come from the `client_roles`
   # claim (emitted by the dashboard client's role mapper) and are mapped to the

@@ -13,17 +13,21 @@ one per dataspace role.
 | Role                | File                                              | Chart                       | Version | Notes                                  |
 | ------------------- | ------------------------------------------------- | --------------------------- | ------- | -------------------------------------- |
 | Operator            | `operator/trust-anchor.yaml`                      | `dsc/trust-anchor`          | 1.0.0   |                                        |
-| Operator            | `operator/central-marketplace.yaml`               | `dsc/data-space-connector`  | 10.3.2  | Central marketplace (BAE + IdP)        |
+| Operator            | `operator/central-marketplace.yaml`               | `dsc/data-space-connector`  | 10.4.12 | Central marketplace (BAE + IdP)        |
 | Operator            | `operator/onboarding-portal.yaml`                 | onboarding-portal chart     | —       | Participant onboarding UI              |
-| Consumer            | `consumer/consumer.yaml`                          | `dsc/data-space-connector`  | 10.3.2  |                                        |
-| Provider            | `provider/provider.yaml`                          | `dsc/data-space-connector`  | 10.3.2  |                                        |
-| Provider            | `provider/provider-central-marketplace.yaml`      | `dsc/data-space-connector`  | 10.3.2  | Provider as central-marketplace peer   |
+| Consumer            | `consumer/consumer.yaml`                          | `dsc/data-space-connector`  | 10.4.12 |                                        |
+| Provider            | `provider/provider.yaml`                          | `dsc/data-space-connector`  | 10.4.12 |                                        |
+| Provider            | `provider/provider-central-marketplace.yaml`      | `dsc/data-space-connector`  | 10.4.12 | Provider as central-marketplace peer   |
 | Provider (overlay)  | `provider/fdsc-dashboard.yaml`                    | —                           | —       | Dashboard ingress overlay (nginx)      |
-| Consumer + Provider | `consumer-and-provider/consumer-and-provider.yaml`| `dsc/data-space-connector`  | 10.3.2  |                                        |
+| Consumer + Provider | `consumer-and-provider/consumer-and-provider.yaml`| `dsc/data-space-connector`  | 10.4.12 |                                        |
 
 ## Prerequisites
 
-- Kubernetes cluster (the examples assume AWS EKS — `gp2` StorageClass; adapt for other clouds)
+- Kubernetes cluster (the examples assume AWS EKS — `gp2` StorageClass; adapt for other clouds).
+  The Marketplace (BAE) PVCs are the exception: the examples leave them on the cluster's
+  default StorageClass. Since BAE 1.1.0 (shipped in DSC 10.4.x) you can pin them explicitly
+  with `marketplace.bizEcosystemChargingBackend.persistence.storageClass` and the equivalent
+  key on the IDM PVC.
 - Helm 3
 - `nginx` ingress controller
 - `cert-manager` with a `prod` ClusterIssuer reachable from your namespaces
@@ -46,30 +50,76 @@ helm install trust-anchor dsc/trust-anchor -n trust-anchor --create-namespace \
 Consumer:
 ```sh
 helm install consumer dsc/data-space-connector -n consumer --create-namespace \
-  -f consumer/consumer.yaml --version 10.3.2
+  -f consumer/consumer.yaml --version 10.4.12
 ```
 
 Provider:
 ```sh
 helm install provider dsc/data-space-connector -n provider --create-namespace \
-  -f provider/provider.yaml --version 10.3.2
+  -f provider/provider.yaml --version 10.4.12
 ```
 
 Consumer + Provider (note the release name `coprov` is referenced by service URLs inside the values file):
 ```sh
 helm install coprov dsc/data-space-connector -n coprov --create-namespace \
-  -f consumer-and-provider/consumer-and-provider.yaml --version 10.3.2
+  -f consumer-and-provider/consumer-and-provider.yaml --version 10.4.12
 ```
 
 Operator (central marketplace) and a provider that peers with it (release names are
 referenced by service URLs inside the values files):
 ```sh
 helm install central-marketplace dsc/data-space-connector -n central-marketplace --create-namespace \
-  -f operator/central-marketplace.yaml --version 10.3.2
+  -f operator/central-marketplace.yaml --version 10.4.12
 
 helm install provider-central-mp dsc/data-space-connector -n provider-central-mp --create-namespace \
-  -f provider/provider-central-marketplace.yaml --version 10.3.2
+  -f provider/provider-central-marketplace.yaml --version 10.4.12
 ```
+
+## Upgrading from 10.3.x
+
+DSC **10.4.0** drops the SEAMWARE-patched Keycloak image
+(`quay.io/seamware/keycloak:26.6.3`) and runs the upstream default
+`docker.io/keycloak/keycloak:26.7.0` instead (CloudPirates chart `0.21.28`). The
+fork only existed to carry the OID4VCI QR-endpoint fix
+([keycloak/keycloak#44623](https://github.com/keycloak/keycloak/issues/44623)) and the
+Liquibase changeset `26.7.0-verifiable-credential`; both are upstream now. Two
+consequences:
+
+**1. The PKCS12 keystore must live under `data/<realm-name>`.** Since Keycloak
+**26.6.4** the `java-keystore` realm key provider only reads keystores from a
+directory named after the realm, inside `${kc.home.dir}/data` (i.e.
+`/opt/keycloak/data` on the official image). A keystore outside that boundary still
+works for a read-only startup, but any create/update on the key provider fails. All
+the example values files already apply the move — the directory name matches
+`keycloak.realm.name`:
+
+```yaml
+keycloak:
+  extraVolumeMounts:
+    - { name: did-material, mountPath: /opt/keycloak/data/provider }  # was: /did-material
+    - { name: realms,       mountPath: /opt/keycloak/data/import }
+  signingKey:
+    storePath: /opt/keycloak/data/provider/cert.pfx                   # was: /did-material/cert.pfx
+```
+
+The `get-did` initContainer keeps writing to its own `/did-material` mount of the
+same `emptyDir` — only the Keycloak container's view is constrained. If you use a
+`did:elsi` issuer (disabled in every example here), apply the same move to
+`elsi.storePath`.
+
+**2. An existing Keycloak database from `26.6.3` needs a manual migration.** The
+`26.6.3` fork carried early, differently-named versions of the
+`user_ver_credential` / `issued_ver_credential` schema changes that upstream
+`26.7.0` introduces under its own changeset ids, so Liquibase checksums no longer
+match on startup. Run
+[`doc/scripts/migration_26.6.3_to_26.7.0.sql`](https://github.com/FIWARE/data-space-connector/blob/main/doc/scripts/migration_26.6.3_to_26.7.0.sql)
+once against that database **before** starting Keycloak on `26.7.0`, and back the
+database up first — it alters constraints and column types in place. This does not
+apply to fresh installs or to deployments already on `26.7.0`.
+
+Everything else in these values files renders unchanged against 10.4.12; the
+`decentralized-iam` bump (2.1.17 → 2.1.19) and the Marketplace bump (BAE 1.0.4 →
+1.1.0) are additive.
 
 ## What each role brings up
 
@@ -104,6 +154,56 @@ marketplace, IdentityHub, fdsc-edc) → OTEL Collector → Tempo → Grafana, wi
 Tempo datasource auto-provisioned. Per-component service names can be overridden
 via each component's `tracing.serviceName` (e.g. `scorpio.tracing.serviceName`).
 See the [DSC observability guide](https://github.com/FIWARE/data-space-connector/tree/main/doc/deployment-integration/observability).
+
+## Credential revocation (optional, disabled by default)
+
+DSC 10.4.x adds opt-in credential revocation via the
+[Token Status List](https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/)
+draft. It has two halves, both off in the example values — enable them together:
+
+```yaml
+# The status-list server itself (Rust service + Postgres + Redis).
+statusListServer:
+  enabled: true
+  postgresql:
+    host: postgres
+    database: statuslistdb
+    auth:
+      username: statuslist
+      existingSecret: statuslist.postgres.credentials.postgresql.acid.zalan.do
+  env:
+    serverDomain: status-list.example.com
+
+# The Keycloak plugin that registers each issued VC with that server.
+keycloak:
+  tokenStatusList:
+    enabled: true
+    serverUrl: http://status-list-server:8081
+    # credential types that become revocable
+    credentialTypes: ["LegalPersonCredential", "OperatorCredential"]
+```
+
+The plugin JAR (`io.github.wistefan:keycloak-token-status-plugin`) is pulled from
+Maven Central by an init container at pod startup; the server image is
+`quay.io/wi_stefan/status-list-server`. Signing keys can be handed to the server as a
+cert-manager Secret via `statusListServer.signing.*` instead of its built-in ACME
+manager. See the [upstream server docs](https://github.com/adorsys/status-list-server)
+and the [plugin docs](https://github.com/ADORSYS-GIS/token-status-link).
+
+## Keycloak behind an outbound HTTP proxy (optional)
+
+Also new in 10.4.x: `keycloak.proxy.*` injects the standard `HTTPS_PROXY` /
+`HTTP_PROXY` / `NO_PROXY` env vars plus the Keycloak SPI proxy mapping, so Keycloak
+(and the token-status-list plugin) can reach outside the cluster through a forward
+proxy.
+
+```yaml
+keycloak:
+  proxy:
+    enabled: true
+    httpsProxy: http://squid-proxy.infra.svc.cluster.local:8888
+    noProxy: "localhost,*.cluster.local,*.svc"
+```
 
 ## References
 

@@ -3,7 +3,7 @@
 # Do NOT deploy as-is in production. Review credentials, hostnames, cert
 # issuers, resource sizing, persistence, and disabled subcharts first.
 # ─────────────────────────────────────────────────────────────────────────────
-# Provider deployment example for DSC chart 10.3.2.
+# Provider deployment example for DSC chart 10.4.12.
 
 # Off = `issuance-secret` is provisioned externally (sealed-secrets/Vault).
 # On  = chart generates it; Secret is annotated `resource-policy: keep`.
@@ -177,24 +177,25 @@ decentralizedIam:
         til: { enabled: false }
         tir: { enabled: false }
 
-    # CCS: per-service config "to access X, present VC of type Y from issuer Z".
-    # `${DID}` is a runtime env var exported by `prepScript`, NOT a Helm template.
+    # CCS (Credentials Config Service) is embedded in the verifier in DSC 10.x
+    # (served by `vcverifier.deployment.configServer` on :8090). The standalone
+    # subchart stays disabled; its database + service registration now live under
+    # `vcverifier` below.
     credentials-config-service:
+      enabled: false
+
+    # Verifier: OIDC endpoint that exchanges a VC for a JWT (via OID4VP).
+    # Two keys mounted:
+    #   /certs         → ECDSA TLS cert for `x509_san_dns` client identification
+    #   /certs-signing → RSA token-signing key (RSA mandatory, see keyAlgorithm below)
+    vcverifier:
       enabled: true
-      fullnameOverride: credentials-config-service
-      ingress:
-        enabled: false
-      database:
-        persistence: true
-        dialect: POSTGRES
-        host: postgres
-        port: 5432
-        name: ccsdb
-        username: ccs
-        existingSecret:
-          enabled: true
-          name: ccs.postgres.credentials.postgresql.acid.zalan.do
-          key: password
+      fullnameOverride: verifier
+      m2m:
+        authEnabled: false
+      # Service registration (post-install job) posts each service's required
+      # credentials/scopes to the embedded CCS (configServer on :8090).
+      # `${DID}` is a runtime env var exported by `prepScript`, NOT a Helm template.
       registration:
         enabled: true
         prepScript: export DID=did:web:did-provider.example.com:did
@@ -266,16 +267,6 @@ decentralizedIam:
                   format:
                     "dc+sd-jwt":
                       alg: [ES256]
-
-    # Verifier: OIDC endpoint that exchanges a VC for a JWT (via OID4VP).
-    # Two keys mounted:
-    #   /certs         → ECDSA TLS cert for `x509_san_dns` client identification
-    #   /certs-signing → RSA token-signing key (RSA mandatory, see keyAlgorithm below)
-    vcverifier:
-      enabled: true
-      fullnameOverride: verifier
-      m2m:
-        authEnabled: false
       ingress:
         enabled: true
         className: "nginx"
@@ -291,6 +282,18 @@ decentralizedIam:
           - secretName: verifier.example.com-tls
             hosts: [verifier.example.com]
       deployment:
+        # Embedded Credentials Config Service: serves the config REST API on :8090
+        # backed by the ccs database below — replaces the standalone CCS subchart.
+        configServer:
+          enabled: true
+        database:
+          name: ccsdb
+          host: postgres
+          type: postgres
+          existingSecret:
+            name: ccs.postgres.credentials.postgresql.acid.zalan.do
+            usernameKey: username
+            passwordKey: password
         logging: { level: debug }
         verifier:
           tirAddress: http://trusted-issuers-list:8080/
@@ -311,7 +314,7 @@ decentralizedIam:
         server:
           host: https://verifier.example.com
         configRepo:
-          configEndpoint: http://credentials-config-service:8080
+          configEndpoint: http://verifier:8090
         additionalVolumes:
           - name: certs-vol
             secret:
@@ -400,7 +403,7 @@ decentralizedIam:
 
     # ODRL-PAP: policy admin point; exposes ODRL policies as an OPA bundle.
     # GENERAL_ORGANIZATION_DID is injected via additionalEnvVars (the 1.4.x
-    # command/args workaround is no longer needed in the 10.3.2 default image).
+    # command/args workaround is no longer needed in the 10.4.12 default image).
     odrl-pap:
       enabled: true
       fullnameOverride: odrl-pap
@@ -452,7 +455,7 @@ scorpio:
   service: { type: ClusterIP }
   ccs:
     enabled: false
-    endpoint: http://credentials-config-service:8080
+    endpoint: http://verifier:8090
 
 # TMForum APIs (business layer for marketplace + contract-management).
 # `allInOne` = single pod instead of one per API; persisted on Scorpio (NGSI-LD).
@@ -646,9 +649,13 @@ contract-management:
 
 # Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI).
 # The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
-# DSC 10.x uses the CloudPirates Keycloak chart with the SEAMWARE-patched upstream
-# image (quay.io/seamware/keycloak:26.6.3) as the umbrella default — no image
-# override needed. The umbrella also enables the three oid4vc-vci feature flags.
+# DSC 10.4.x uses the CloudPirates Keycloak chart (0.21.28) with the UPSTREAM
+# image `docker.io/keycloak/keycloak:26.7.0` as the chart default — no image
+# override needed. The SEAMWARE fork (quay.io/seamware/keycloak:26.6.3) existed
+# only to carry the OID4VCI QR-endpoint fix (keycloak/keycloak#44623) and the
+# Liquibase changeset `26.7.0-verifiable-credential`; both are upstream in
+# 26.7.0, so it was dropped in 10.4.0. The umbrella still enables the three
+# oid4vc-vci feature flags.
 keycloak:
   enabled: true
   metrics: { enabled: true }
@@ -691,7 +698,13 @@ keycloak:
       usernameKey: username
       passwordKey: password
   extraVolumeMounts:
-    - { name: did-material, mountPath: /did-material }
+    # Since Keycloak 26.6.4 the `java-keystore` realm key provider only reads
+    # keystores under `${kc.home.dir}/data/<realm-name>` (/opt/keycloak/data on
+    # the official image). The directory name MUST equal `keycloak.realm.name`
+    # below; keystores outside that boundary break any update of the key provider.
+    # The `get-did` initContainer keeps its own /did-material view of the same
+    # emptyDir — only the Keycloak container's mount is constrained.
+    - { name: did-material, mountPath: /opt/keycloak/data/provider }
     - { name: realms,       mountPath: /opt/keycloak/data/import }
   extraVolumes:
     - name: did-material
@@ -745,7 +758,7 @@ keycloak:
     name: provider
     frontendUrl: https://accounts.example.com
     sslRequired: none
-    # SEAMWARE-patched KC ties /create-credential-offer to a per-user
+    # Keycloak 26.7.0 ties /create-credential-offer to a per-user
     # verifiableCredentials list; auto-assign the full declared set to every user.
     wallets:
       issueCredentialsToUsers: true
@@ -780,47 +793,6 @@ keycloak:
         defaultClientScopes: []
         optionalClientScopes: []
 
-      # OIDC client backing the fdsc-dashboard login (see fdsc-dashboard.auth below).
-      - clientId: dashboard
-        enabled: true
-        description: Client to access the FDSC dashboard
-        surrogateAuthRequired: false
-        alwaysDisplayInConsole: false
-        clientAuthenticatorType: client-secret
-        defaultRoles: []
-        redirectUris:
-          - https://dashboard-provider.example.com/callback/keycloak
-        webOrigins:
-          - https://dashboard-provider.example.com
-        notBefore: 0
-        bearerOnly: false
-        consentRequired: false
-        standardFlowEnabled: true
-        implicitFlowEnabled: false
-        directAccessGrantsEnabled: false
-        serviceAccountsEnabled: false
-        publicClient: true
-        frontchannelLogout: false
-        protocol: openid-connect
-        protocolMappers:
-          - name: client-roles-mapper
-            protocol: openid-connect
-            protocolMapper: oidc-usermodel-client-role-mapper
-            consentRequired: false
-            config:
-              multivalued: "true"
-              userinfo.token.claim: "true"
-              id.token.claim: "true"
-              access.token.claim: "true"
-              claim.name: "client_roles"
-              jsonType.label: "String"
-              usermodel.clientRoleMapping.clientId: "dashboard"
-        authenticationFlowBindingOverrides: {}
-        fullScopeAllowed: true
-        nodeReRegistrationTimeout: -1
-        defaultClientScopes: ["openid", "profile", "roles"]
-        optionalClientScopes: []
-
     # Client roles per Keycloak client. `${DID}` is the self-client.
     clientRoles:
       ${DID}:
@@ -829,9 +801,6 @@ keycloak:
         - { name: REPRESENTATIVE, description: "Is allowed to register.",         clientRole: true }
         - { name: seller,         description: "Seller role",                     clientRole: true }
         - { name: admin,          description: "Admin role",                      clientRole: true }
-      dashboard:
-        - { name: admin,  description: "Dashboard admin",  clientRole: true }
-        - { name: viewer, description: "Dashboard viewer", clientRole: true }
 
     # Do NOT redeclare /admin and /consumer groups: chart's `defaultGroups` already
     # adds them and a redeclaration breaks --import-realm with a UNIQUE constraint.
@@ -847,7 +816,6 @@ keycloak:
         clientRoles:
           ${DID}: [seller, admin]
           account: [view-profile, manage-account]
-          dashboard: [admin]
         groups:
           - /consumer
 
@@ -904,7 +872,7 @@ keycloak:
 
   # `keyAlgorithm` must match the PKCS12 key and the VC `credential_signing_alg`.
   signingKey:
-    storePath: /did-material/cert.pfx
+    storePath: /opt/keycloak/data/provider/cert.pfx
     storePassword: "${STORE_PASS}"
     keyAlias: didPrivateKey
     keyPassword: "${STORE_PASS}"
@@ -913,44 +881,7 @@ keycloak:
 
 # Operator UI for TIL/CCS/ODRL-PAP/APISIX. Gated by the `dashboard` Keycloak client.
 fdsc-dashboard:
-  enabled: true
-  ingress:
-    enabled: true
-    className: nginx
-    annotations:
-      kubernetes.io/ingress.class: nginx
-      cert-manager.io/cluster-issuer: prod
-      cert-manager.io/private-key-algorithm: ECDSA
-
-    hosts:
-      - host: dashboard-provider.example.com
-        paths:
-          - "/"
-    tls:
-      - secretName: dashboard-provider.example.com-tls
-        hosts:
-          - dashboard-provider.example.com
-  apisix:
-    enabled: true
-    # Service name is <helm-release>-apisix-admin. Update if release != `provider`.
-    dashboardUrl: http://provider-apisix-admin:9180/ui
-    adminKey: admin
-  apiUrls:
-    til: http://trusted-issuers-list:8080
-    ccs: http://credentials-config-service:8080
-    odrl: http://odrl-pap:8080
-  auth:
-    config:
-      providers:
-        - id: keycloak
-          displayName: Keycloak
-          issuer: https://accounts.example.com/realms/provider
-          clientId: dashboard
-          scopes: ["openid", "profile", "roles"]
-          rolesClaimPath: "client_roles"
-          roleMapping:
-            admin: "admin"
-          silentRenew: true
+  enabled: false
 
 # Extra raw manifests:
 #   1. ca-cert Secret           → LE CA chain bundled into Keycloak's PKCS12.

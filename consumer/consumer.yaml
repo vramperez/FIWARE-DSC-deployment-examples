@@ -3,7 +3,7 @@
 # Do NOT deploy as-is in production. Review credentials, hostnames, cert
 # issuers, resource sizing, persistence, and disabled subcharts first.
 # ─────────────────────────────────────────────────────────────────────────────
-# Consumer deployment example for DSC chart 10.3.2.
+# Consumer deployment example for DSC chart 10.4.12.
 # A consumer ISSUES VCs to its own users and publishes its DID; nothing else.
 # No Verifier/CCS/TIL/APISIX/Scorpio/TMForum/Marketplace.
 
@@ -68,9 +68,13 @@ registration:        { enabled: false }
 credentials:         { enabled: false }
 
 # Keycloak: VC Issuer (OID4VCI) for the consumer's own users.
-# DSC 10.x uses the CloudPirates Keycloak chart with the SEAMWARE-patched upstream
-# image (quay.io/seamware/keycloak:26.6.3) as the umbrella default — no image
-# override needed. The umbrella also enables the three oid4vc-vci feature flags.
+# DSC 10.4.x uses the CloudPirates Keycloak chart (0.21.28) with the UPSTREAM
+# image `docker.io/keycloak/keycloak:26.7.0` as the chart default — no image
+# override needed. The SEAMWARE fork (quay.io/seamware/keycloak:26.6.3) existed
+# only to carry the OID4VCI QR-endpoint fix (keycloak/keycloak#44623) and the
+# Liquibase changeset `26.7.0-verifiable-credential`; both are upstream in
+# 26.7.0, so it was dropped in 10.4.0. The umbrella still enables the three
+# oid4vc-vci feature flags.
 keycloak:
   enabled: true
   metrics: { enabled: true }
@@ -114,7 +118,13 @@ keycloak:
       usernameKey: username
       passwordKey: password
   extraVolumeMounts:
-    - { name: did-material, mountPath: /did-material }
+    # Since Keycloak 26.6.4 the `java-keystore` realm key provider only reads
+    # keystores under `${kc.home.dir}/data/<realm-name>` (/opt/keycloak/data on
+    # the official image). The directory name MUST equal `keycloak.realm.name`
+    # below; keystores outside that boundary break any update of the key provider.
+    # The `get-did` initContainer keeps its own /did-material view of the same
+    # emptyDir — only the Keycloak container's mount is constrained.
+    - { name: did-material, mountPath: /opt/keycloak/data/consumer }
     - { name: realms,       mountPath: /opt/keycloak/data/import }
   extraVolumes:
     - name: did-material
@@ -164,7 +174,7 @@ keycloak:
     name: consumer
     frontendUrl: https://accounts-consumer.example.com
     sslRequired: none
-    # SEAMWARE-patched KC ties /create-credential-offer to a per-user
+    # Keycloak 26.7.0 ties /create-credential-offer to a per-user
     # verifiableCredentials list; auto-assign the full declared set to every user.
     wallets:
       issueCredentialsToUsers: true
@@ -326,7 +336,7 @@ keycloak:
 
   # `keyAlgorithm` must match the PKCS12 key and each VC's `credential_signing_alg`.
   signingKey:
-    storePath: /did-material/cert.pfx
+    storePath: /opt/keycloak/data/consumer/cert.pfx
     storePassword: "${STORE_PASS}"
     keyAlias: didPrivateKey
     keyPassword: "${STORE_PASS}"

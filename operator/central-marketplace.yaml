@@ -4,10 +4,11 @@
 # ("test") for the bootstrap flow; review credentials, hostnames, cert
 # issuers, resource sizing, persistence, and disabled subcharts first.
 # ─────────────────────────────────────────────────────────────────────────────
-# Central marketplace deployment — counterpart to provider.yaml. Hosts the
-# dataspace-wide marketplace (BAE) and the central Keycloak (IdP for the
-# onboarding portal). Also owns the shared Postgres cluster used by the
-# `trust-anchor` namespace (TIR + onboarding) via cross-namespace secrets.
+# Central marketplace deployment example for DSC chart 10.4.12 — counterpart to
+# provider.yaml. Hosts the dataspace-wide marketplace (BAE) and the central
+# Keycloak (IdP for the onboarding portal). Also owns the shared Postgres cluster
+# used by the `trust-anchor` namespace (TIR + onboarding) via cross-namespace
+# secrets.
 
 # Off = `issuance-secret` is provisioned externally (sealed-secrets/Vault).
 issuance:
@@ -145,85 +146,9 @@ decentralizedIam:
       fullnameOverride: verifier
       m2m:
         authEnabled: false
-      ingress:
-        enabled: true
-        annotations:
-          cert-manager.io/cluster-issuer: prod
-          cert-manager.io/private-key-algorithm: "ECDSA"
-          cert-manager.io/common-name: "verifier-central-marketplace.example.com"
-        hosts:
-          - host: "verifier-central-marketplace.example.com"
-            paths:
-              - "/"
-        tls:
-          - secretName: verifier-central-marketplace.example.com-tls
-            hosts:
-              - verifier-central-marketplace.example.com
-      deployment:
-        logging:
-          level: debug
-        verifier:
-          tirAddress: http://trusted-issuers-list:8080/
-          did: did:web:did-central-marketplace.example.com
-          supportedModes: ["byValue", "byReference"]
-          generateKey: false
-          keyAlgorithm: RS256
-          sessionExpiry: 60
-          keyPath: /certs-signing/tls.key
-          clientIdentification:
-            kid: "random-kid1"
-            keyPath: /certs/tls.key
-            requestKeyAlgorithm: ES256
-            id: x509_san_dns:verifier-central-marketplace.example.com
-            certificatePath: /certs/tls.crt
-        server:
-          host: https://verifier-central-marketplace.example.com
-        configRepo:
-          configEndpoint: http://credentials-config-service:8080
-        additionalVolumes:
-          - name: certs-vol
-            secret:
-              secretName: verifier-central-marketplace.example.com-tls
-          - name: signing-certs-vol
-            secret:
-              secretName: verifier-rsa-cert
-        additionalVolumeMounts:
-          - name: certs-vol
-            mountPath: /certs
-          - name: signing-certs-vol
-            mountPath: /certs-signing
-        # Auto-registers this DID at the dataspace TIR. Dev/test only —
-        # in prod participants are registered via the onboarding portal.
-        initContainers:
-          - name: register-at-tir
-            image: curlimages/curl:8.7.1
-            args:
-              - -v
-              - -X
-              - POST
-              - "http://tir.trust-anchor.svc.cluster.local:8080/issuer"
-              - -H
-              - "Content-Type: application/json"
-              - -d
-              - '{"did": "did:web:did-central-marketplace.example.com", "credentials": []}'
-    # CCS: per-service config "to access X, present VC of type Y from issuer Z".
-    # Two scopes registered for the central marketplace login flow.
-    credentials-config-service:
-      enabled: true
-      fullnameOverride: credentials-config-service
-      ingress:
-        enabled: false
-      database:
-        persistence: true
-        host: postgres
-        dialect: postgres
-        port: 5432
-        name: ccsdb
-        username: ccs
-        existingSecret:
-          enabled: true
-          name: ccs.postgres.credentials.postgresql.acid.zalan.do
-          key: password
+      # Service registration (post-install job) posts each service's required
+      # credentials/scopes to the embedded CCS (configServer on :8090).
+      # Two scopes registered for the central marketplace login flow.
       registration:
         enabled: true
         prepScript: export DID=did:web:did-central-marketplace.example.com
@@ -302,6 +227,85 @@ decentralizedIam:
                     "dc+sd-jwt":
                       alg:
                         - ES256
+      ingress:
+        enabled: true
+        annotations:
+          cert-manager.io/cluster-issuer: prod
+          cert-manager.io/private-key-algorithm: "ECDSA"
+          cert-manager.io/common-name: "verifier-central-marketplace.example.com"
+        hosts:
+          - host: "verifier-central-marketplace.example.com"
+            paths:
+              - "/"
+        tls:
+          - secretName: verifier-central-marketplace.example.com-tls
+            hosts:
+              - verifier-central-marketplace.example.com
+      deployment:
+        # Embedded Credentials Config Service: serves the config REST API on :8090
+        # backed by the ccs database below — replaces the standalone CCS subchart.
+        configServer:
+          enabled: true
+        database:
+          name: ccsdb
+          host: postgres
+          type: postgres
+          existingSecret:
+            name: ccs.postgres.credentials.postgresql.acid.zalan.do
+            usernameKey: username
+            passwordKey: password
+        logging:
+          level: debug
+        verifier:
+          tirAddress: http://trusted-issuers-list:8080/
+          did: did:web:did-central-marketplace.example.com
+          supportedModes: ["byValue", "byReference"]
+          generateKey: false
+          keyAlgorithm: RS256
+          sessionExpiry: 60
+          keyPath: /certs-signing/tls.key
+          clientIdentification:
+            kid: "random-kid1"
+            keyPath: /certs/tls.key
+            requestKeyAlgorithm: ES256
+            id: x509_san_dns:verifier-central-marketplace.example.com
+            certificatePath: /certs/tls.crt
+        server:
+          host: https://verifier-central-marketplace.example.com
+        configRepo:
+          configEndpoint: http://verifier:8090
+        additionalVolumes:
+          - name: certs-vol
+            secret:
+              secretName: verifier-central-marketplace.example.com-tls
+          - name: signing-certs-vol
+            secret:
+              secretName: verifier-rsa-cert
+        additionalVolumeMounts:
+          - name: certs-vol
+            mountPath: /certs
+          - name: signing-certs-vol
+            mountPath: /certs-signing
+        # Auto-registers this DID at the dataspace TIR. Dev/test only —
+        # in prod participants are registered via the onboarding portal.
+        initContainers:
+          - name: register-at-tir
+            image: curlimages/curl:8.7.1
+            args:
+              - -v
+              - -X
+              - POST
+              - "http://tir.trust-anchor.svc.cluster.local:8080/issuer"
+              - -H
+              - "Content-Type: application/json"
+              - -d
+              - '{"did": "did:web:did-central-marketplace.example.com", "credentials": []}'
+    # CCS (Credentials Config Service) is embedded in the verifier in DSC 10.x
+    # (served by `vcverifier.deployment.configServer` on :8090). The standalone
+    # subchart stays disabled; its database + service registration now live under
+    # `vcverifier` above.
+    credentials-config-service:
+      enabled: false
 
   # ODRL/APISIX stack disabled — the central marketplace exposes its UI
   # directly via nginx Ingress; only the provider gates access with ODRL.
@@ -334,7 +338,7 @@ scorpio:
   # No auto-registration at CCS — Scorpio is internal here, not a sold data-service.
   ccs:
     enabled: false
-    endpoint: http://credentials-config-service:8080
+    endpoint: http://verifier:8090
     configMap: scorpio-registration
 
   additionalVolumes:
@@ -345,8 +349,13 @@ scorpio:
 
 # Keycloak: dual role — IDP for humans + VC Issuer (OID4VCI). Realm `central`.
 # The org DID private key MUST be Keycloak's VC-signing key (see `get-did` initContainer).
-# DSC 10.x uses the CloudPirates Keycloak chart with the SEAMWARE-patched upstream
-# image (quay.io/seamware/keycloak:26.6.3) as the umbrella default — no image override.
+# DSC 10.4.x uses the CloudPirates Keycloak chart (0.21.28) with the UPSTREAM
+# image `docker.io/keycloak/keycloak:26.7.0` as the chart default — no image
+# override needed. The SEAMWARE fork (quay.io/seamware/keycloak:26.6.3) existed
+# only to carry the OID4VCI QR-endpoint fix (keycloak/keycloak#44623) and the
+# Liquibase changeset `26.7.0-verifiable-credential`; both are upstream in
+# 26.7.0, so it was dropped in 10.4.0. The umbrella still enables the three
+# oid4vc-vci feature flags.
 keycloak:
   enabled: true
   metrics:
@@ -404,7 +413,13 @@ keycloak:
       passwordKey: password
 
   extraVolumeMounts:
-    - mountPath: /did-material
+    # Since Keycloak 26.6.4 the `java-keystore` realm key provider only reads
+    # keystores under `${kc.home.dir}/data/<realm-name>` (/opt/keycloak/data on
+    # the official image). The directory name MUST equal `keycloak.realm.name`
+    # below; keystores outside that boundary break any update of the key provider.
+    # The `get-did` initContainer keeps its own /did-material view of the same
+    # emptyDir — only the Keycloak container's mount is constrained.
+    - mountPath: /opt/keycloak/data/central
       name: did-material
     - mountPath: /opt/keycloak/data/import
       name: realms
@@ -469,7 +484,7 @@ keycloak:
     name: central
     frontendUrl: https://accounts-central.example.com
     sslRequired: none
-    # SEAMWARE-patched KC ties /create-credential-offer to a per-user
+    # Keycloak 26.7.0 ties /create-credential-offer to a per-user
     # verifiableCredentials list; auto-assign the full declared set to every user.
     wallets:
       issueCredentialsToUsers: true
@@ -608,7 +623,7 @@ keycloak:
               context: https://www.w3.org/2018/credentials/v1
   # `keyAlgorithm` must match the PKCS12 key and each VC's `credential_signing_alg`.
   signingKey:
-    storePath: /did-material/cert.pfx
+    storePath: /opt/keycloak/data/central/cert.pfx
     storePassword: "${STORE_PASS}"
     keyAlias: didPrivateKey
     keyPassword: "${STORE_PASS}"
