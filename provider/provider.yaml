@@ -64,7 +64,7 @@ managedMongo:
                 requests:
                   storage: 2Gi
 
-# cert-manager: ingress TLS + internal signing certs (verifier RSA, DID EC).
+# cert-manager: ingress TLS + internal signing certs (verifier + DID, both EC).
 # If jetstack/cert-manager already runs cluster-wide, set `cert-manager.enabled:
 # false` but keep `certManagerResources` for the ClusterIssuer/Certificate manifests.
 cert-manager:
@@ -187,7 +187,7 @@ decentralizedIam:
     # Verifier: OIDC endpoint that exchanges a VC for a JWT (via OID4VP).
     # Two keys mounted:
     #   /certs         → ECDSA TLS cert for `x509_san_dns` client identification
-    #   /certs-signing → RSA token-signing key (RSA mandatory, see keyAlgorithm below)
+    #   /certs-signing → ECDSA token-signing key
     vcverifier:
       enabled: true
       fullnameOverride: verifier
@@ -300,9 +300,7 @@ decentralizedIam:
           did: did:web:did-provider.example.com:did
           supportedModes: [byValue, byReference]
           generateKey: false
-          # Must be RSA — APISIX's lua-resty-openidc can't verify EC JWTs.
-          # https://github.com/zmartzone/lua-resty-openidc/pull/457
-          keyAlgorithm: RS256
+          keyAlgorithm: ES256
           sessionExpiry: 60
           keyPath: /certs-signing/tls.key
           clientIdentification:
@@ -321,7 +319,7 @@ decentralizedIam:
               secretName: verifier.example.com-tls
           - name: signing-certs-vol
             secret:
-              secretName: verifier-rsa-cert
+              secretName: verifier-signing-cert
         additionalVolumeMounts:
           - name: certs-vol
             mountPath: /certs
@@ -885,7 +883,7 @@ fdsc-dashboard:
 
 # Extra raw manifests:
 #   1. ca-cert Secret           → LE CA chain bundled into Keycloak's PKCS12.
-#   2. verifier RSA Certificate → RSA signing key for the verifier (APISIX needs RSA).
+#   2. verifier Certificate     → EC (P-256) signing key for the verifier's JWTs.
 #   3. nginx Ingress → APISIX gateway (workaround for the chart's Ingress limitations).
 extraManifests:
   # LE CA chain bundled into the PKCS12 keystore by the Keycloak `get-did` init.
@@ -898,11 +896,11 @@ extraManifests:
     data:
       ca.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVWekNDQWorZ0F3SUJBZ0lSQUtwMThlWXJqd29pQ1diVGk3L1V1cUV3RFFZSktvWklodmNOQVFFTEJRQXcKVHpFTE1Ba0dBMVVFQmhNQ1ZWTXhLVEFuQmdOVkJBb1RJRWx1ZEdWeWJtVjBJRk5sWTNWeWFYUjVJRkpsYzJWaApjbU5vSUVkeWIzVndNUlV3RXdZRFZRUURFd3hKVTFKSElGSnZiM1FnV0RFd0hoY05NalF3TXpFek1EQXdNREF3CldoY05NamN3TXpFeU1qTTFPVFU1V2pBeU1Rc3dDUVlEVlFRR0V3SlZVekVXTUJRR0ExVUVDaE1OVEdWMEozTWcKUlc1amNubHdkREVMTUFrR0ExVUVBeE1DUlRjd2RqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVJCNkFTVApDRmgvdmpjd0RNQ2dRZXIrVnRxRWt6N0pBTnVyWnhMUCtVOVRDZWlvTDZzcDVaOFZSdlJiWWs0UDFJTkJtYmVmClFISkZIQ3hjU2pLbXd0dkdCV3BsLzlyYThIVzBRRHNVYUpXMnFPSnFjZUowWlZGVDNoYlVIaWZCTS8yamdmZ3cKZ2ZVd0RnWURWUjBQQVFIL0JBUURBZ0dHTUIwR0ExVWRKUVFXTUJRR0NDc0dBUVVGQndNQ0JnZ3JCZ0VGQlFjRApBVEFTQmdOVkhSTUJBZjhFQ0RBR0FRSC9BZ0VBTUIwR0ExVWREZ1FXQkJTdVNKN2NoeDFFb0cvYW91VmdkQVI0Cndwd0FnREFmQmdOVkhTTUVHREFXZ0JSNXRGbm1lN2JsNUFGemdBaUl5QnBZOXVtYmJqQXlCZ2dyQmdFRkJRY0IKQVFRbU1DUXdJZ1lJS3dZQkJRVUhNQUtHRm1oMGRIQTZMeTk0TVM1cExteGxibU55TG05eVp5OHdFd1lEVlIwZwpCQXd3Q2pBSUJnWm5nUXdCQWdFd0p3WURWUjBmQkNBd0hqQWNvQnFnR0lZV2FIUjBjRG92TDNneExtTXViR1Z1ClkzSXViM0puTHpBTkJna3Foa2lHOXcwQkFRc0ZBQU9DQWdFQWp4NjZmRGRMazV5d0ZuM0N6QTF3MXFmeWxIVUQKYUVmMFFacFhjSnNlZGRKR1NmYlVVT3ZiTlI5Ti9RUTE2SzFsWGw0VkZ5aG1HWERUNUtkZmNyMFJ2SUlWck54RgpoNGxxSHRSUkNQNlJCUnN0cWJaMnpVUmdxYWtuL1hpcDBpYVFMMElkZkhCWnIzOTZGZ2tubmlSWUZja0tPUlBHCnlNM1FLbmQ2Nmd0TXN0OEk1bmtSUWxBZy9KYitHYzNlZ0l2dUdLV2JvRTFHODlOVHNOOUxUREQzUExqMGRVTXIKT0l1cVZqTEI4cEVDNnlrOWVucmxycWpYUWdrTEVZaFh6cTdkTGFmdjVWa2lnNkdsMG51dXFqcWZwMFExYmkxbwp5Vk5BbFhlNmFVWHc5MkNjZ2hDOWJOc0tFTzErTTUyWVk1K29mSVhsUy9TRVFidlZZWUJMWjV5ZWlnbFY2dDNTCk02SCt2VEcwYVA5WUh6TG4vS1ZPSHpHUWZYRFA3cU01dGtmKzdkaVplN28yZnc2TzdJdk42ZnNRWEVRUWo4VEoKVVhKeHYyL3VKaGN1eS90U0RnWHdITThVazM0V05iUlQ3ekdUR2tRUlgwZ3NiakFlYS9qWUFvV3YwWnZRUndwcQpQZTc5RC9pN0NlcDhxV25BKzdBRS8zQjNTLzNkRUVZbWMwbHBlMTM2NkEvNkdFZ2sza3RyOVBFb1FyTENoczZJCnR1M3duTkxCMmV1QzhJS0dMUUZwR3RPTy8yL2hpQUtqeWFqYUJQMjV3MWpGMFdsOEJicW5lM3VaMnExR3lQRkoKWVJtVDcvT1hwbU9IL0ZWTHR3Uys4bmcxY0FtcEN1alB3dGVKWk5jREcwc0Yybi9zYzArU1FmNDlmZHlVSzB0eQorVlV3Rmo5dG1XeHlSL009Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KCi0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpNSUlGYXpDQ0ExT2dBd0lCQWdJUkFJSVF6N0RTUU9OWlJHUGd1Mk9DaXdBd0RRWUpLb1pJaHZjTkFRRUxCUUF3ClR6RUxNQWtHQTFVRUJoTUNWVk14S1RBbkJnTlZCQW9USUVsdWRHVnlibVYwSUZObFkzVnlhWFI1SUZKbGMyVmgKY21Ob0lFZHliM1Z3TVJVd0V3WURWUVFERXd4SlUxSkhJRkp2YjNRZ1dERXdIaGNOTVRVd05qQTBNVEV3TkRNNApXaGNOTXpVd05qQTBNVEV3TkRNNFdqQlBNUXN3Q1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1ClpYUWdVMlZqZFhKcGRIa2dVbVZ6WldGeVkyZ2dSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQlkKTVRDQ0FpSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnSVBBRENDQWdvQ2dnSUJBSzNvSkhQMEZEZnptNTRyVnlnYwpoNzdjdDk4NGtJeHVQT1pYb0hqM2RjS2kvdlZxYnZZQVR5amIzbWlHYkVTVHRyRmovUlFTYTc4ZjB1b3hteUYrCjBUTTh1a2oxM1huZnM3ai9FdkVobWt2QmlvWnhhVXBtWm15UGZqeHd2NjBwSWdiejVNRG1nSzdpUzQrM21YNlUKQTUvVFI1ZDhtVWdqVStnNHJrOEtiNE11MFVsWGpJQjB0dG92MERpTmV3TndJUnQxOGpBOCtvK3UzZHBqcStzVwpUOEtPRVV0K3p3dm8vN1YzTHZTeWUwcmdUQklsREhDTkF5bWc0Vk1rN0JQWjdobS9FTE5LakQrSm8yRlIzcXlICkI1VDBZM0hzTHVKdlc1aUI0WWxjTkhsc2R1ODdrR0o1NXR1a21pOG14ZEFRNFE3ZTJSQ09GdnUzOTZqM3grVUMKQjVpUE5naVY1K0kzbGcwMmRaNzdEbkt4SFp1OEEvbEpCZGlCM1FXMEt0WkI2YXdCZHBVS0Q5amYxYjBTSHpVdgpLQmRzMHBqQnFBbGtkMjVITjdyT3JGbGVhSjEvY3RhSnhRWkJLVDVaUHQwbTlTVEpFYWRhbzB4QUgwYWhtYlduCk9sRnVoanVlZlhLbkVnVjRXZTArVVhnVkN3T1BqZEF2QmJJK2Uwb2NTM01GRXZ6RzZ1QlFFM3hEazNTenluVG4Kamg4QkNOQXcxRnR4TnJRSHVzRXdNRnhJdDRJN21LWjlZSXFpb3ltQ3pMcTlnd1Fib29NRFFhSFdCZkVid3JidwpxSHlHTzBhb1NDcUkzSGFhZHI4ZmFxVTlHWS9yT1BOazNzZ3JEUW9vLy9mYjRoVkMxQ0xRSjEzaGVmNFk1M0NJCnJVN20yWXM2eHQwblVXNy92R1QxTTBOUEFnTUJBQUdqUWpCQU1BNEdBMVVkRHdFQi93UUVBd0lCQmpBUEJnTlYKSFJNQkFmOEVCVEFEQVFIL01CMEdBMVVkRGdRV0JCUjV0Rm5tZTdibDVBRnpnQWlJeUJwWTl1bWJiakFOQmdrcQpoa2lHOXcwQkFRc0ZBQU9DQWdFQVZSOVlxYnl5cUZEUURMSFlHbWtnSnlrSXJHRjFYSXB1K0lMbGFTL1Y5bFpMCnViaHpFRm5USVpkKzUweHgrN0xTWUswNXFBdnFGeUZXaGZGUURsbnJ6dUJaNmJySkZlK0duWStFZ1BiazZaR1EKM0JlYllodEY4R2FWMG54dnd1bzc3eC9QeTlhdUovR3BzTWl1L1gxK212b2lCT3YvMlgvcWtTc2lzUmNPai9LSwpORnRZMlB3QnlWUzV1Q2JNaW9nemlVd3RoRHlDMys2V1Z3VzZMTHYzeExmSFRqdUN2akhJSW5Oemt0SENnS1E1Ck9SQXpJNEpNUEorR3NsV1lIYjRwaG93aW01N2lhenRYT29Kd1Rkd0p4NG5MQ2dkTmJPaGRqc252enF2SHU3VXIKVGtYV1N0QW16T1Z5eWdocXBaWGpGYUgzcE8zSkxGK2wrLytzS0FJdXZ0ZDd1K054ZTVBVzB3ZGVSbE44TndkQwpqTlBFbHB6Vm1iVXE0SlVhZ0VpdVREa0h6c3hIcEZLVks3cTQrNjNTTTFOOTVSMU5iZFdoc2NkQ2IrWkFKelZjCm95aTNCNDNualRPUTV5T2YrMUNjZVd4RzFiUVZzNVp1ZnBzTWxqcTRVaTAvMWx2aCt3akNoUDRrcUtPSjJxeHEKNFJncXNhaERZVnZUSDl3N2pYYnlMZWlOZGQ4WE0ydzlVL3Q3eTBGZi85eWkwR0U0NFphNHJGMkxOOWQxMVRQQQptUkd1blVIQmNuV0V2Z0pCUWw5bkpFaVUwWnNudmdjL3ViaFBnWFJSNFhxMzdaMGo0cjdnMVNnRUV6d3hBNTdkCmVteVB4Z2NZeG4vZVI0NC9LSjRFQnMrbFZEUjN2ZXlKbStrWFE5OWIyMS8ramg1WG9zMUFuWDVpSXRyZUdDYz0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQoKLS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNHekNDQWFHZ0F3SUJBZ0lRUWRLZDBYTHE3cWVBd1N4czZTK0hVakFLQmdncWhrak9QUVFEQXpCUE1Rc3cKQ1FZRFZRUUdFd0pWVXpFcE1DY0dBMVVFQ2hNZ1NXNTBaWEp1WlhRZ1UyVmpkWEpwZEhrZ1VtVnpaV0Z5WTJnZwpSM0p2ZFhBeEZUQVRCZ05WQkFNVERFbFRVa2NnVW05dmRDQllNakFlRncweU1EQTVNRFF3TURBd01EQmFGdzAwCk1EQTVNVGN4TmpBd01EQmFNRTh4Q3pBSkJnTlZCQVlUQWxWVE1Ta3dKd1lEVlFRS0V5QkpiblJsY201bGRDQlQKWldOMWNtbDBlU0JTWlhObFlYSmphQ0JIY205MWNERVZNQk1HQTFVRUF4TU1TVk5TUnlCU2IyOTBJRmd5TUhZdwpFQVlIS29aSXpqMENBUVlGSzRFRUFDSURZZ0FFelp2Vm40Q0RDdXdKU3ZNV1NqNWN6M2VzM21jRkRSMEh0dHdXCisxcUxGTnZpY1dERXVrV1ZFWW1PNmdiZjl5b1dIS1M1eGNVeTRBUGdIb0lZT0l2WFJkZ0thbTdtQUhmN0FsRjkKSXRnS2JwcGJkOS93K2tIc09keDF5bWdIREIvcW8wSXdRREFPQmdOVkhROEJBZjhFQkFNQ0FRWXdEd1lEVlIwVApBUUgvQkFVd0F3RUIvekFkQmdOVkhRNEVGZ1FVZkVLV3J0NUxTRHY2a3ZpZWpNOXRpNmx5TjVVd0NnWUlLb1pJCnpqMEVBd01EYUFBd1pRSXdlM2xPUmxDRXdrU0hSaHRGY1A5WW1kNzAvYVRTVmFZZ0xYVFdOTHhCbzFCZkFTZFcKdEw0bmRRYXZFaTUxbUkzOEFqRUFpL1YzYk5USVphcmdDeXp1Rkowbk42VDVVNlZSNUNtRDEvaVFNVnRDbndyMQovcTRBYU9lTVNRKzJiMXRiRmZMbgotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0t
 
-  # RSA cert for the verifier's JWT signing (mounted as volume `signing-certs-vol`).
+  # EC (P-256) cert for the verifier's JWT signing (mounted as volume `signing-certs-vol`).
   - apiVersion: cert-manager.io/v1
     kind: Certificate
     metadata:
-      name: verifier-internal-rsa-cert
+      name: verifier-internal-signing-cert
       namespace: provider
     spec:
       commonName: verifier.example.com
@@ -913,10 +911,11 @@ extraManifests:
         kind: ClusterIssuer
         name: prod
       privateKey:
-        algorithm: RSA
-      secretName: verifier-rsa-cert
+        algorithm: ECDSA
+        size: 256
+      secretName: verifier-signing-cert
       usages:
-        - key encipherment
+        - digital signature
 
   # Backend Service name is <helm-release>-apisix-gateway. Update if release != `provider`.
   - apiVersion: networking.k8s.io/v1
