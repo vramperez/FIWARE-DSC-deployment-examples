@@ -7,21 +7,26 @@
 # to participants joining the dataspace. Runs in the `central-marketplace`
 # namespace alongside the trust anchor / TIR; the central Keycloak is its IdP.
 #
-# ⚠️ NOT part of the DSC umbrella chart — this is the standalone On-Boarding-Portal
-# chart (image tag 0.1.0). It is NOT covered by the DSC 9.0.3 → 10.4.12 bump.
-# IMPORTANT: with DSC 10.4.x the central Keycloak is upstream 26.7.0 (CloudPirates
-# chart 0.21.28), which removed the legacy OID4VCI model still used below — the flat
-# `vc.operator-credential.*` realm attributes and the mapper keys
-# `supportedCredentialTypes` / `subjectProperty`. For this portal to work against
-# a 10.x central Keycloak you need an On-Boarding-Portal release that targets the
-# post-26.4 OID4VCI API, and these realm-injection values must then be migrated to
-# the new model (format `vc+sd-jwt`→`dc+sd-jwt`, `vct`→`verifiable_credential_type`,
-# per-scope `verifiableCredentials`, `subjectProperty`→`claim.name`). Verify the
-# portal version before deploying.
+# NOT part of the DSC umbrella chart — this is the standalone On-Boarding-Portal
+# chart (`fiware/onboarding-portal` 1.4.0, appVersion 0.2.0), released on its own
+# cycle. Install it separately; it is not covered by the DSC chart version.
+#
+# Version floor: chart 1.4.0 / image 0.2.0 is the FIRST release that speaks the
+# post-26.4 OID4VCI model (keycloak/keycloak#39768) used by the upstream Keycloak
+# 26.7.0 that DSC 10.4.x ships. Earlier portal releases inject the legacy model —
+# flat `vc.<name>.*` realm attributes and mappers keyed by `supportedCredentialTypes`
+# / `subjectProperty` — which Keycloak 26.4+ silently ignores, so issuance fails.
+#
+# The values below are an OVERLAY on the portal's own `application.default.yaml`.
+# The backend deep-merges maps but REPLACES arrays wholesale
+# (On-Boarding-Portal `backend/src/service/config.service.ts`), which is why
+# `defaultRealmConfig.clients` and `defaultRealmConfig.clientScopes` re-declare
+# everything they need, including the upstream LegalPersonCredential scope.
 
 image:
   pullPolicy: Always
-  tag: 0.1.0
+  # Defaults to the chart's appVersion; pinned here so the example is reproducible.
+  tag: 0.2.0
 
 # `database`: Secret auto-created by the Zalando Postgres operator
 # (per-user `<user>.<cluster>.credentials.postgresql.acid.zalan.do`).
@@ -36,7 +41,6 @@ secrets:
     clientIdKey: login-client-id
     clientSecretKey: login-client-secret
   keycloak:
-    create: true
     secretName: onboarding-secrets
     usernameKey: keycloak-username
     passwordKey: keycloak-password
@@ -64,109 +68,19 @@ config:
       didCreationEnabled: true
       baseUrl: https://accounts-central.example.com
       realmName: master
-      # additionalClientScopes is a LIST → Spring/Quarkus replaces the whole
-      # list when overriden, so we re-declare the upstream LegalPersonCredential
-      # entry alongside the new OperatorCredential one.
-      additionalClientScopes:
-        - name: LegalPersonCredential
-          description: OIDC4VC Scope, that adds all properties required for a user.
-          protocol: openid-connect
-          attributes:
-            include.in.token.scope: "false"
-            display.on.consent.screen: "false"
-          protocolMappers:
-            - name: context-mapper
-              protocol: oid4vc
-              protocolMapper: oid4vc-context-mapper
-              consentRequired: false
-              config:
-                context: https://www.w3.org/2018/credentials/v1
-                supportedCredentialTypes: LegalPersonCredential
-            - name: firstName-mapper
-              protocol: oid4vc
-              protocolMapper: oid4vc-user-attribute-mapper
-              consentRequired: false
-              config:
-                subjectProperty: firstName
-                supportedCredentialTypes: LegalPersonCredential
-                userAttribute: firstName
-            - name: email-mapper
-              protocol: oid4vc
-              protocolMapper: oid4vc-user-attribute-mapper
-              consentRequired: false
-              config:
-                subjectProperty: email
-                supportedCredentialTypes: LegalPersonCredential
-                userAttribute: email
-            - name: lastName-mapper
-              protocol: oid4vc
-              protocolMapper: oid4vc-user-attribute-mapper
-              consentRequired: false
-              config:
-                subjectProperty: lastName
-                supportedCredentialTypes: LegalPersonCredential
-                userAttribute: lastName
-            - name: role-mapper
-              protocol: oid4vc
-              protocolMapper: oid4vc-target-role-mapper
-              consentRequired: false
-              config:
-                subjectProperty: roles
-                supportedCredentialTypes: LegalPersonCredential
-                clientId: ${DID}
 
-        # Issued to users that operate clusters and consume the data-service.
-        # Mirrors LegalPersonCredential but with `supportedCredentialTypes: OperatorCredential`.
-        - name: OperatorCredential
-          description: OIDC4VC Scope for users that operate clusters / consume the data-service.
-          protocol: openid-connect
-          attributes:
-            include.in.token.scope: "false"
-            display.on.consent.screen: "false"
-          protocolMappers:
-            - name: context-mapper-operator
-              protocol: oid4vc
-              protocolMapper: oid4vc-context-mapper
-              consentRequired: false
-              config:
-                context: https://www.w3.org/2018/credentials/v1
-                supportedCredentialTypes: OperatorCredential
-            - name: firstName-mapper-operator
-              protocol: oid4vc
-              protocolMapper: oid4vc-user-attribute-mapper
-              consentRequired: false
-              config:
-                subjectProperty: firstName
-                supportedCredentialTypes: OperatorCredential
-                userAttribute: firstName
-            - name: email-mapper-operator
-              protocol: oid4vc
-              protocolMapper: oid4vc-user-attribute-mapper
-              consentRequired: false
-              config:
-                subjectProperty: email
-                supportedCredentialTypes: OperatorCredential
-                userAttribute: email
-            - name: lastName-mapper-operator
-              protocol: oid4vc
-              protocolMapper: oid4vc-user-attribute-mapper
-              consentRequired: false
-              config:
-                subjectProperty: lastName
-                supportedCredentialTypes: OperatorCredential
-                userAttribute: lastName
-            - name: role-mapper-operator
-              protocol: oid4vc
-              protocolMapper: oid4vc-target-role-mapper
-              consentRequired: false
-              config:
-                subjectProperty: roles
-                supportedCredentialTypes: OperatorCredential
-                clientId: ${DID}
+      keys:
+        # `kid` of the ES256 signing key the portal generates in every realm it
+        # creates. did-helper publishes the realm's verification method as
+        # `<did>#<kid>`, and the `vc.signing_key_id: ${KEY_ID}` of each credential
+        # scope below resolves to this value. Leave empty to fall back to the DID.
+        keyId: key-1
 
-      # Realm bootstrap applied on first start of the central Keycloak.
-      # `${DID}` is expanded at runtime — convention: one client per target DID.
+      # Realm bootstrap applied when the portal creates a participant's realm.
+      # `${DID}` and `${KEY_ID}` are expanded at runtime by the portal, NOT by Helm.
       defaultRealmConfig:
+        # ARRAY → replaces the chart default entirely, so this client carries the
+        # OID4VCI opt-in and the credential scopes itself.
         clients:
           - clientId: ${DID}
             enabled: true
@@ -176,6 +90,11 @@ config:
             clientAuthenticatorType: client-secret
             redirectUris: []
             directAccessGrantsEnabled: true
+            # Keycloak 26.4+ keeps VC clients on `openid-connect` and opts them into
+            # issuance with this attribute; without it /create-credential-offer
+            # answers 403.
+            attributes:
+              oid4vci.enabled: "true"
             defaultClientScopes:
               - web-origins
               - acr
@@ -183,7 +102,11 @@ config:
               - profile
               - basic
               - email
-            optionalClientScopes: []
+            # Credential scopes go here, NOT in defaultClientScopes — Keycloak
+            # rejects the latter with "Credential client scope not found".
+            optionalClientScopes:
+              - LegalPersonCredential
+              - OperatorCredential
             surrogateAuthRequired: false
             alwaysDisplayInConsole: false
             defaultRoles: []
@@ -199,6 +122,152 @@ config:
             fullScopeAllowed: true
             nodeReRegistrationTimeout: -1
 
+        # OID4VCI model of Keycloak 26.4+: one ClientScope with `protocol: oid4vc`
+        # per issuable credential, described by its own `vc.*` attributes. The
+        # pre-26.4 realm attributes `vc.<name>.*` and the `components.CredentialBuilder`
+        # block are gone. Declared inside the realm import (rather than in
+        # `additionalClientScopes`, which the Admin API applies afterwards) so the
+        # scopes already exist when the client above references them.
+        #
+        # ARRAY → replaces the chart default, so LegalPersonCredential is re-declared
+        # verbatim alongside the OperatorCredential this dataspace adds.
+        clientScopes:
+          - name: LegalPersonCredential
+            description: OID4VC scope that issues the LegalPersonCredential.
+            protocol: oid4vc
+            attributes:
+              include.in.token.scope: "true"
+              display.on.consent.screen: "false"
+              vc.issuer_did: ${DID}
+              # Must match the kid of the realm signing key (`keys.keyId` above),
+              # otherwise issuance fails with "No key for id '<...>' and algorithm
+              # ES256 available".
+              vc.signing_key_id: ${KEY_ID}
+              # dc+sd-jwt, not vc+sd-jwt: OID4VCI 1.0 renamed the SD-JWT VC identifier.
+              vc.format: dc+sd-jwt
+              # Drives the SD-JWT `vct` claim; supported_credential_types drives the
+              # JWT-VC-JSON `type` array and the metadata credential_definition.type.
+              vc.verifiable_credential_type: LegalPersonCredential
+              vc.supported_credential_types: LegalPersonCredential
+              vc.credential_signing_alg: ES256
+              vc.credential_build_config.token_jws_type: dc+sd-jwt
+              # Both on purpose: the admin console displays expiry_in_seconds, but the
+              # `exp` of the issued credential comes from refresh_interval_in_seconds.
+              vc.expiry_in_seconds: "31536000"
+              vc.refresh_interval_in_seconds: "31536000"
+              # Red list of KC 26.4+: iss,iat,nbf,exp,cnf,vct,status must NOT be
+              # undisclosed, or issuance aborts with "UndisclosedClaims contains red
+              # listed claim names".
+              vc.credential_build_config.sd_jwt.visible_claims: "iss,iat,nbf,exp,cnf,vct,status,roles,email"
+              vc.credential_build_config.sd_jwt.number_of_decoys: "3"
+              # Holder binding via proof-of-possession, replacing proof_types_supported.
+              vc.binding_required: "true"
+              vc.binding_required_proof_types: jwt
+              vc.cryptographic_binding_methods_supported: jwk
+            # `supportedCredentialTypes` is gone: a mapper belongs to exactly one client
+            # scope, so mapper-to-credential membership is structural now.
+            # `subjectProperty` is now `claim.name`. Names are unique within the scope.
+            protocolMappers:
+              - name: context-mapper
+                protocol: oid4vc
+                protocolMapper: oid4vc-context-mapper
+                consentRequired: false
+                config:
+                  context: https://www.w3.org/2018/credentials/v1
+              - name: firstName-mapper
+                protocol: oid4vc
+                protocolMapper: oid4vc-user-attribute-mapper
+                consentRequired: false
+                config:
+                  claim.name: firstName
+                  userAttribute: firstName
+              - name: email-mapper
+                protocol: oid4vc
+                protocolMapper: oid4vc-user-attribute-mapper
+                consentRequired: false
+                config:
+                  claim.name: email
+                  userAttribute: email
+              - name: lastName-mapper
+                protocol: oid4vc
+                protocolMapper: oid4vc-user-attribute-mapper
+                consentRequired: false
+                config:
+                  claim.name: lastName
+                  userAttribute: lastName
+              - name: role-mapper
+                protocol: oid4vc
+                protocolMapper: oid4vc-target-role-mapper
+                consentRequired: false
+                config:
+                  claim.name: roles
+                  clientId: ${DID}
+
+          # Issued to users that operate clusters and consume the data-service.
+          # The provider's verifier matches it on `$.vct == "OperatorCredential"`
+          # plus `$.firstName` and `$.roles` — see provider/provider.yaml.
+          - name: OperatorCredential
+            description: OID4VC scope for users that operate clusters / consume the data-service.
+            protocol: oid4vc
+            attributes:
+              include.in.token.scope: "true"
+              display.on.consent.screen: "false"
+              vc.issuer_did: ${DID}
+              vc.signing_key_id: ${KEY_ID}
+              vc.format: dc+sd-jwt
+              vc.verifiable_credential_type: OperatorCredential
+              vc.supported_credential_types: OperatorCredential
+              vc.credential_signing_alg: ES256
+              vc.credential_build_config.token_jws_type: dc+sd-jwt
+              vc.expiry_in_seconds: "31536000"
+              vc.refresh_interval_in_seconds: "31536000"
+              vc.credential_build_config.sd_jwt.visible_claims: "iss,iat,nbf,exp,cnf,vct,status,roles,email"
+              vc.credential_build_config.sd_jwt.number_of_decoys: "3"
+              vc.binding_required: "true"
+              vc.binding_required_proof_types: jwt
+              vc.cryptographic_binding_methods_supported: jwk
+            protocolMappers:
+              - name: context-mapper-operator
+                protocol: oid4vc
+                protocolMapper: oid4vc-context-mapper
+                consentRequired: false
+                config:
+                  context: https://www.w3.org/2018/credentials/v1
+              - name: firstName-mapper-operator
+                protocol: oid4vc
+                protocolMapper: oid4vc-user-attribute-mapper
+                consentRequired: false
+                config:
+                  claim.name: firstName
+                  userAttribute: firstName
+              - name: email-mapper-operator
+                protocol: oid4vc
+                protocolMapper: oid4vc-user-attribute-mapper
+                consentRequired: false
+                config:
+                  claim.name: email
+                  userAttribute: email
+              - name: lastName-mapper-operator
+                protocol: oid4vc
+                protocolMapper: oid4vc-user-attribute-mapper
+                consentRequired: false
+                config:
+                  claim.name: lastName
+                  userAttribute: lastName
+              - name: role-mapper-operator
+                protocol: oid4vc
+                protocolMapper: oid4vc-target-role-mapper
+                consentRequired: false
+                config:
+                  claim.name: roles
+                  clientId: ${DID}
+
+        # Realm-level defaults for clients created later. ARRAY → replaces the chart
+        # default, which only lists LegalPersonCredential.
+        defaultOptionalClientScopes:
+          - LegalPersonCredential
+          - OperatorCredential
+
         roles:
           client:
             ${DID}:
@@ -207,21 +276,6 @@ config:
               - name: OPERATOR
                 description: Operator role — required to obtain an OperatorCredential
                   and access the purchased data-service.
-        # OID4VCI issuer metadata for OperatorCredential. `*.signing_alg` /
-        # `*.format` / `*.vct` MUST match the realm's signing key and what
-        # the Verifier expects (see provider verifier `keyAlgorithm: ES256`).
-        # expiry_in_s = 1 year.
-        attributes:
-          vc.operator-credential.expiry_in_s: "31536000"
-          vc.operator-credential.format: vc+sd-jwt
-          vc.operator-credential.scope: OperatorCredential
-          vc.operator-credential.vct: OperatorCredential
-          vc.operator-credential.credential_signing_alg_values_supported: ES256
-          vc.operator-credential.credential_build_config.token_jws_type: vc+sd-jwt
-          vc.operator-credential.credential_build_config.visible_claims: roles,email
-          vc.operator-credential.credential_build_config.proof_types_supported: "{\"jwt\":{\"proof_signing_alg_values_supported\":[\"ES256\"]}}"
-          vc.operator-credential.credential_build_config.decoys: "3"
-          vc.operator-credential.credential_build_config.signing_algorithm: ES256
         # SMTP for Keycloak emails (account verification, password reset).
         # YAML anchors (&smtpHost / &smtpPort) re-used by `config.email` below
         # so host/port live in one place. Credentials come from `extraEnvVars`.

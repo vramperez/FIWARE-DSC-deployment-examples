@@ -14,7 +14,7 @@ one per dataspace role.
 | ------------------- | ------------------------------------------------- | --------------------------- | ------- | -------------------------------------- |
 | Operator            | `operator/trust-anchor.yaml`                      | `dsc/trust-anchor`          | 1.0.0   |                                        |
 | Operator            | `operator/central-marketplace.yaml`               | `dsc/data-space-connector`  | 10.4.12 | Central marketplace (BAE + IdP)        |
-| Operator            | `operator/onboarding-portal.yaml`                 | onboarding-portal chart     | —       | Participant onboarding UI              |
+| Operator            | `operator/onboarding-portal.yaml`                 | `fiware/onboarding-portal`  | 1.4.0   | Participant onboarding UI (app 0.2.0)  |
 | Consumer            | `consumer/consumer.yaml`                          | `dsc/data-space-connector`  | 10.4.12 |                                        |
 | Provider            | `provider/provider.yaml`                          | `dsc/data-space-connector`  | 10.4.12 |                                        |
 | Provider            | `provider/provider-central-marketplace.yaml`      | `dsc/data-space-connector`  | 10.4.12 | Provider as central-marketplace peer   |
@@ -38,6 +38,8 @@ one per dataspace role.
 
 ```sh
 helm repo add dsc https://fiware.github.io/data-space-connector/
+# the onboarding portal lives in a different chart repo
+helm repo add fiware https://fiware.github.io/helm-charts
 helm repo update
 ```
 
@@ -45,6 +47,13 @@ Operator (trust anchor):
 ```sh
 helm install trust-anchor dsc/trust-anchor -n trust-anchor --create-namespace \
   -f operator/trust-anchor.yaml --version 1.0.0
+```
+
+Operator (onboarding portal) — a standalone chart on its own release cycle, deployed
+into the `central-marketplace` namespace alongside the trust anchor:
+```sh
+helm install onboarding-portal fiware/onboarding-portal -n central-marketplace \
+  -f operator/onboarding-portal.yaml --version 1.4.0
 ```
 
 Consumer:
@@ -120,6 +129,17 @@ apply to fresh installs or to deployments already on `26.7.0`.
 Everything else in these values files renders unchanged against 10.4.12; the
 `decentralized-iam` bump (2.1.17 → 2.1.19) and the Marketplace bump (BAE 1.0.4 →
 1.1.0) are additive.
+
+**3. The onboarding portal needs its own bump.** It is a separate chart, so the DSC
+version says nothing about it: `fiware/onboarding-portal` **1.4.0** (app **0.2.0**) is
+the first release that speaks the post-26.4 OID4VCI model, and anything older silently
+fails to issue against Keycloak 26.7.0. Its values move with it — credential scopes
+migrate from `config.app.keycloak.additionalClientScopes` to
+`defaultRealmConfig.clientScopes` with `protocol: oid4vc`, mappers swap
+`subjectProperty` for `claim.name` and drop `supportedCredentialTypes`, the format
+identifier goes `vc+sd-jwt` → `dc+sd-jwt`, `vct` → `verifiable_credential_type`, and
+the VC client needs `attributes: {oid4vci.enabled: "true"}`. The flat
+`vc.<name>.*` realm attributes are gone. See `operator/onboarding-portal.yaml`.
 
 ## What each role brings up
 
