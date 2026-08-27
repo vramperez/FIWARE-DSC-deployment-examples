@@ -3,8 +3,17 @@
 # Do NOT deploy as-is in production. Rotate the APISIX `adminKey`, review
 # Keycloak client/role mapping, and confirm hostnames + cert issuer.
 # ─────────────────────────────────────────────────────────────────────────────
-# Overlay for the `fdsc-dashboard` subchart — operator UI for TIL/CCS/ODRL-PAP
-# /APISIX.
+# Overlay for the `fdsc-dashboard` subchart (chart 0.6.8, shipped by DSC 10.4.12)
+# — operator UI for TIL/TIR/CCS/ODRL-PAP/APISIX, plus optional embedded Grafana
+# panels, a Tempo traces view and the Keycloak credential-status integration.
+#
+# Apply it on top of the provider values, e.g.
+#   helm install provider dsc/data-space-connector -n provider \
+#     -f provider/provider.yaml -f provider/fdsc-dashboard.yaml --version 10.4.12
+#
+# In-cluster URLs below assume the Helm release is named `provider`; the chart
+# derives Service names as `<release>-<component>`. Rename them if your release
+# differs.
 
 fdsc-dashboard:
   enabled: true
@@ -23,21 +32,82 @@ fdsc-dashboard:
       - secretName: dashboard-provider.example.com-tls
         hosts:
           - dashboard-provider.example.com
-  # Service name pattern is <helm-release>-apisix-admin. Here the release is
-  # `provider-central-mp` — update if you rename the release.
+
+  # Service name pattern is <helm-release>-apisix-admin.
   # `adminKey: admin` is the APISIX default; rotate and source from a Secret in prod.
   apisix:
     enabled: true
-    dashboardUrl: http://provider-central-mp-apisix-admin:9180/ui
+    dashboardUrl: http://provider-apisix-admin:9180/ui
     adminKey: admin
-  # In-cluster URLs for the services the dashboard administers.
+
+  # In-cluster URLs for the services the dashboard administers. Each one is
+  # rendered into a `*_API_URL` env var; leaving one empty disables that view.
   apiUrls:
     til: http://trusted-issuers-list:8080
+    # The dataspace-wide TIR lives in the trust-anchor namespace — same address
+    # the verifier's `register-at-tir` init container uses in provider.yaml.
+    tir: http://tir.trust-anchor.svc.cluster.local:8080
     ccs: http://verifier:8090
     odrl: http://odrl-pap:8080
-  # OIDC login against the provider's Keycloak. Roles come from the `client_roles`
-  # claim (emitted by the dashboard client's role mapper) and are mapped to the
-  # dashboard's internal `admin` role.
+
+  # ── Embedded Grafana panels ────────────────────────────────────────────────
+  # Off by default in the chart. Requires the umbrella's opt-in observability
+  # stack — set `grafana.enabled: true` (and `tempo.enabled: true` for the
+  # tracing block below) in the provider values; see the README's Observability
+  # section.
+  #
+  # `panelsJson` is a JSON *string*, not YAML: the chart passes it straight into
+  # the GRAFANA_PANELS_JSON env var. `path` is the Grafana dashboard path,
+  # `span` its width in a 12-column grid.
+  grafana:
+    enabled: true
+    url: http://provider-grafana:80
+    panelsJson: |
+      [{"title":"APISIX routes","path":"/d/apisix-routes/apisix-routes?orgId=1&from=now-1h&to=now&timezone=browser&var-route=$__all&var-service=$__all&refresh=30s","span":12}]
+
+  # ── Tempo traces view ──────────────────────────────────────────────────────
+  # Requires `grafana.enabled` above plus `tempo.enabled: true` on the umbrella.
+  #
+  # WARNING: `tempoDatasourceId` is NOT deterministic. The DSC chart provisions
+  # the Tempo datasource without a fixed `uid` (templates/grafana-tempo-datasource-cm.yaml),
+  # so Grafana generates one per install. Read it off the running instance before
+  # filling this in:
+  #   Grafana UI → Connections → Data sources → Tempo (the uid is in the URL), or
+  #   curl -u <admin> http://provider-grafana:80/api/datasources/name/Tempo | jq -r .uid
+  tracing:
+    enabled: true
+    tempoDatasourceId: REPLACE_WITH_THE_UID_FROM_YOUR_GRAFANA
+
+  # ── Keycloak credential-status integration ─────────────────────────────────
+  # Base URL only — the dashboard derives the realm from the OIDC auth config
+  # below, and must point at the same Keycloak. It reads Keycloak's status-list
+  # endpoint to show whether an issued credential has been revoked, so it only
+  # has anything to display when `keycloak.tokenStatusList` and
+  # `statusListServer` are enabled on the umbrella (README → Credential revocation).
+  keycloak:
+    url: http://provider-keycloak:8080
+
+  # Escape hatch for custom-built dashboard images that read extra configuration
+  # at runtime. Anything the chart models natively (Grafana, tracing, APISIX)
+  # should use its own key instead of being injected here.
+  # additionalEnvVars:
+  #   - name: SOME_CUSTOM_FLAG
+  #     value: "true"
+
+  # ── OIDC login ─────────────────────────────────────────────────────────────
+  # PREREQUISITE: `provider/provider.yaml` does NOT create the Keycloak client
+  # this section points at. Declare it yourself under `keycloak.realm`:
+  #   * a `dashboard` client — public, `standardFlowEnabled: true`, redirect URI
+  #     `https://dashboard-provider.example.com/callback/keycloak`, and an
+  #     `oidc-usermodel-client-role-mapper` protocol mapper emitting the
+  #     `client_roles` claim for that client
+  #   * `clientRoles.dashboard`: `admin` and `viewer`
+  #   * the matching role on whichever user should reach the UI
+  # Working copies of all three live in `provider/provider-central-marketplace.yaml`
+  # and `consumer-and-provider/consumer-and-provider.yaml` — copy from there.
+  #
+  # Roles arrive in the `client_roles` claim and are mapped to the dashboard's
+  # internal `admin` / `viewer` roles.
   auth:
     config:
       providers:
@@ -48,5 +118,6 @@ fdsc-dashboard:
           scopes: ["openid", "profile", "roles"]
           rolesClaimPath: "client_roles"
           roleMapping:
-            admin: "admin" # Requires user(s) in Keycloak with this role for admin access
+            admin: "admin"   # Requires user(s) in Keycloak with this role for admin access
+            viewer: "viewer" # Read-only access
           silentRenew: true

@@ -107,7 +107,7 @@ did:
     server:
       runServer: "true"
       certPath: /certs/tls.crt
-      hostUrl: "https://did-provider.example.com/did" # did:web:did-provider.example.com:did
+      hostUrl: "https://did-provider.example.com/did" # did:web:did-provider.example.com:did --> https://did-provider.example.com/did/did.json
       keystorePasswordSecretName: ""
       keystorePasswordSecretKey: ""
       keyAlias: "myAlias"
@@ -877,7 +877,10 @@ keycloak:
     keyAlgorithm: ES256
     did: did:web:did-provider.example.com:did
 
-# Operator UI for TIL/CCS/ODRL-PAP/APISIX. Gated by the `dashboard` Keycloak client.
+# Operator UI for TIL/TIR/CCS/ODRL-PAP/APISIX. Off here — it lives in the
+# `provider/fdsc-dashboard.yaml` overlay, applied as a second `-f`. Note that
+# neither file declares the `dashboard` Keycloak client the UI logs in against;
+# the overlay lists what you have to add to `keycloak.realm` above.
 fdsc-dashboard:
   enabled: false
 

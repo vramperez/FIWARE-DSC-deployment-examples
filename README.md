@@ -18,7 +18,7 @@ one per dataspace role.
 | Consumer            | `consumer/consumer.yaml`                          | `dsc/data-space-connector`  | 10.4.12 |                                        |
 | Provider            | `provider/provider.yaml`                          | `dsc/data-space-connector`  | 10.4.12 |                                        |
 | Provider            | `provider/provider-central-marketplace.yaml`      | `dsc/data-space-connector`  | 10.4.12 | Provider as central-marketplace peer   |
-| Provider (overlay)  | `provider/fdsc-dashboard.yaml`                    | —                           | —       | Dashboard ingress overlay (nginx)      |
+| Provider (overlay)  | `provider/fdsc-dashboard.yaml`                    | `fdsc-dashboard` (subchart) | 0.6.8   | Operator UI overlay — see below        |
 | Consumer + Provider | `consumer-and-provider/consumer-and-provider.yaml`| `dsc/data-space-connector`  | 10.4.12 |                                        |
 
 ## Prerequisites
@@ -151,6 +151,35 @@ the VC client needs `attributes: {oid4vci.enabled: "true"}`. The flat
 - **Consumer + Provider** — Same as Provider plus extra Keycloak realm config
   (`OperatorCredential` issuance + per-peer client) so this participant can
   also consume from other providers.
+
+## Operator dashboard (overlay)
+
+`provider/fdsc-dashboard.yaml` enables the `fdsc-dashboard` subchart (0.6.8, shipped
+by DSC 10.4.12) and is applied as a second `-f` on top of `provider/provider.yaml`:
+
+```sh
+helm install provider dsc/data-space-connector -n provider --create-namespace \
+  -f provider/provider.yaml -f provider/fdsc-dashboard.yaml --version 10.4.12
+```
+
+Besides the TIL / TIR / CCS / ODRL-PAP / APISIX views it demonstrates three optional
+integrations, each of which needs something switched on elsewhere:
+
+| Overlay key | What it adds | Depends on |
+| ----------- | ------------ | ---------- |
+| `grafana.*` | Embedded Grafana panels (`panelsJson` is a JSON string) | `grafana.enabled: true` — see [Observability](#observability-optional-disabled-by-default) |
+| `tracing.*` | Tempo traces view | `grafana.enabled` + `tempo.enabled` |
+| `keycloak.url` | Credential revocation status read from Keycloak's status-list endpoint | [Credential revocation](#credential-revocation-optional-disabled-by-default) |
+
+Two gotchas the overlay comments repeat:
+
+- `tracing.tempoDatasourceId` is **not** deterministic. The chart provisions the Tempo
+  datasource without a fixed `uid`, so Grafana mints one per install — read it off the
+  running instance (`/api/datasources/name/Tempo`) before filling it in.
+- Neither `provider.yaml` nor the overlay creates the `dashboard` Keycloak client the
+  UI authenticates against. The overlay lists exactly what to add under
+  `keycloak.realm`; working copies live in `provider/provider-central-marketplace.yaml`
+  and `consumer-and-provider/consumer-and-provider.yaml`.
 
 ## Observability (optional, disabled by default)
 
